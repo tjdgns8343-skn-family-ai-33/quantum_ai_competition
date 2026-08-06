@@ -151,6 +151,74 @@ def smooth_auc(
     return loss, derivative
 
 
+def smooth_ks(
+    probability: np.ndarray,
+    labels: np.ndarray,
+    sample_weight: np.ndarray,
+    *,
+    temperature: float = 0.05,
+    grid: np.ndarray | None = None,
+    sharpness: float | None = None,
+) -> ObjectiveResult:
+    """Negated smooth Kolmogorov-Smirnov statistic and its derivative.
+
+    This is the objective the competition actually scores.  Balanced accuracy at
+    a threshold is ``(1 + TPR(t) - FPR(t)) / 2``, and the submitted threshold is
+    the one maximizing it on out-of-fold data, so the score is a monotone
+    transform of ``max_t [TPR(t) - FPR(t)]`` -- the two-sample KS statistic.
+
+    That distinguishes it from the two surrogates already here.
+    ``soft_balanced_accuracy`` pins the threshold, so as T falls its gradient
+    collapses onto the handful of rows beside that one threshold and overfits
+    them.  ``smooth_auc`` keeps every row involved but optimizes the whole ROC
+    curve, spending effort on operating points the score never uses.  Taking a
+    soft maximum over a grid of thresholds keeps every row contributing at every
+    threshold while still targeting only the best operating point.
+
+    Indicators become ``sigmoid((p - t) / temperature)``; the maximum over the
+    grid becomes a log-sum-exp with the given ``sharpness`` (default: the grid
+    resolution), which is exact as sharpness grows.
+    """
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive.")
+    values = np.asarray(probability, dtype=float)
+    mask = np.asarray(labels) >= 0.5
+    positive_count = int(np.count_nonzero(mask))
+    negative_count = len(values) - positive_count
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("Both classes must be present for KS.")
+    if grid is None:
+        grid = np.linspace(0.05, 0.95, 91)
+    thresholds = np.asarray(grid, dtype=float)
+    if sharpness is None:
+        # Tie the softness of the max to the softness of the indicators so a
+        # single annealing schedule sharpens both together.
+        sharpness = 2.0 / temperature
+
+    # rate[k] = TPR(t_k) - FPR(t_k) with smoothed indicators.
+    difference = values[None, :] - thresholds[:, None]
+    scaled = difference / temperature
+    indicator = np.where(
+        scaled >= 0.0,
+        1.0 / (1.0 + np.exp(-np.abs(scaled))),
+        np.exp(-np.abs(scaled)) / (1.0 + np.exp(-np.abs(scaled))),
+    )
+    row_weight = np.where(mask, 1.0 / positive_count, -1.0 / negative_count)
+    rate = indicator @ row_weight
+
+    # Soft maximum over thresholds, stabilized.
+    shifted = sharpness * (rate - np.max(rate))
+    weights = np.exp(shifted)
+    weights /= np.sum(weights)
+    statistic = float(np.sum(weights * rate))
+
+    # d(soft max)/d(rate_k) = w_k * (1 + sharpness * (rate_k - soft max))
+    rate_derivative = weights * (1.0 + sharpness * (rate - statistic))
+    slope = indicator * (1.0 - indicator) / temperature
+    derivative = -(rate_derivative @ slope) * row_weight
+    return -statistic, derivative
+
+
 def temperature_schedule(
     start: float, stop: float, stages: int
 ) -> list[float]:

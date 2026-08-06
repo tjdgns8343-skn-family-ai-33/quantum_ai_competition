@@ -15,6 +15,7 @@ from scipy.optimize import minimize
 from .objectives import (
     balanced_sample_weights,
     smooth_auc,
+    smooth_ks,
     soft_balanced_accuracy,
     temperature_schedule,
 )
@@ -206,7 +207,7 @@ def optimize_c1_annealed(
     so the gradient stays spread across all rows and no threshold is involved --
     the threshold is chosen afterwards from out-of-fold probabilities.
     """
-    if surrogate not in ("soft_balanced_accuracy", "smooth_auc"):
+    if surrogate not in ("soft_balanced_accuracy", "smooth_auc", "smooth_ks"):
         raise ValueError(f"Unknown C1 surrogate: {surrogate!r}")
     weights, warm_start_summary, initial = optimize_c1_quantum_loss(
         x,
@@ -228,6 +229,8 @@ def optimize_c1_annealed(
     def build_objective(temperature: float):
         if surrogate == "smooth_auc":
             return partial(smooth_auc, temperature=temperature)
+        if surrogate == "smooth_ks":
+            return partial(smooth_ks, temperature=temperature)
         return partial(
             soft_balanced_accuracy, threshold=threshold, temperature=temperature
         )
@@ -478,7 +481,7 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
             weights, optimization, _ = optimize_c1_quantum_loss(
                 x[fit], y[fit], **shared
             )
-        elif config.objective in ("soft_balanced_accuracy", "smooth_auc"):
+        elif config.objective in ("soft_balanced_accuracy", "smooth_auc", "smooth_ks"):
             weights, optimization, _ = optimize_c1_annealed(
                 x[fit],
                 y[fit],
@@ -633,7 +636,7 @@ def run_c1_final(config: C1TrainConfig) -> Path:
     )
     if config.objective == "balanced_bce":
         weights, optimization, initial = optimize_c1_quantum_loss(x, y, **shared)
-    elif config.objective in ("soft_balanced_accuracy", "smooth_auc"):
+    elif config.objective in ("soft_balanced_accuracy", "smooth_auc", "smooth_ks"):
         weights, optimization, initial = optimize_c1_annealed(
             x,
             y,

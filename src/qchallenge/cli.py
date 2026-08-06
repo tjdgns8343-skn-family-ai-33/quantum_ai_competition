@@ -332,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_c1_training_args(c1_final, validation=False)
     c1_final.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc"),
+        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
         default="balanced_bce",
     )
     c1_final.add_argument("--temperature-start", type=float, default=0.30)
@@ -360,7 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     c1_cv.add_argument("--restarts", type=int, default=1)
     c1_cv.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc"),
+        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
         default="balanced_bce",
         help="Annealed surrogates warm up on BCE; smooth_auc scores all pairs instead of the threshold band.",
     )

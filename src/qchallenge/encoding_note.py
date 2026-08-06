@@ -22,6 +22,14 @@ OBJECTIVE_SENTENCES = {
         "a smooth surrogate of balanced accuracy, sigmoid((p - threshold) / T), "
         "lowering T so the objective approaches the scored metric."
     ),
+    "smooth_ks": (
+        "Training first minimized the class-balanced binary cross-entropy of that "
+        "measured probability against the raw public_train.csv label, then annealed "
+        "a smooth two-sample Kolmogorov-Smirnov statistic, the softened maximum over "
+        "candidate thresholds t of TPR(t) - FPR(t) computed from the training labels, "
+        "lowering the smoothing. Both stages read nothing but the circuit's measured "
+        "probability and the raw training label."
+    ),
     "smooth_auc": (
         "Training first minimized the class-balanced binary cross-entropy of that "
         "measured probability against the raw public_train.csv label, then annealed "
