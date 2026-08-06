@@ -48,6 +48,8 @@ from .f1_training import (
 )
 from .compliance import audit_artifact, audit_source
 from .evaluate import evaluate_artifact_on_csv
+from .g1_circuit import G1_DEFAULT_BLOCKS, build_g1_spec
+from .spec_training import SpecTrainConfig, run_spec_cross_validation, run_spec_screen
 from .circuit import FEATURE_LAYOUTS
 from .feature_search import FeatureSearchConfig, run_feature_search
 from .training import TrainConfig, run_final, run_screen
@@ -335,6 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
     c1_cv.add_argument("--maxiter", type=int, default=80)
     c1_cv.add_argument("--folds", type=int, default=5)
     c1_cv.add_argument("--restarts", type=int, default=1)
+    c1_cv.add_argument(
+        "--objective",
+        choices=("balanced_bce", "soft_balanced_accuracy"),
+        default="balanced_bce",
+        help="soft_balanced_accuracy warms up on BCE then anneals toward the scored metric.",
+    )
+    c1_cv.add_argument("--temperature-start", type=float, default=0.20)
+    c1_cv.add_argument("--temperature-stop", type=float, default=0.02)
+    c1_cv.add_argument("--anneal-stages", type=int, default=6)
+    c1_cv.add_argument("--stage-maxiter", type=int, default=50)
     c1_cv.add_argument("--shots", type=int, default=1024)
     c1o_screen = sub.add_parser(
         "screen-c1o",
@@ -501,6 +513,26 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--feature-layout", choices=tuple(FEATURE_LAYOUTS), default="sequential"
     )
+    for command, helptext in (
+        ("screen-g1", "Train/evaluate the latent-group G1 VQC"),
+        ("cross-validate-g1", "Generate G1 quantum-only OOF probabilities and threshold"),
+    ):
+        parser_g1 = sub.add_parser(command, help=helptext)
+        parser_g1.add_argument("--data-dir", default="raw")
+        parser_g1.add_argument("--artifacts-dir", default="artifacts")
+        parser_g1.add_argument("--blocks", type=int, default=G1_DEFAULT_BLOCKS)
+        parser_g1.add_argument("--seed", type=int, default=2026)
+        parser_g1.add_argument("--split-seed", type=int, default=None)
+        parser_g1.add_argument("--init-scale", type=float, default=1.0)
+        parser_g1.add_argument("--affine-scale-center", type=float, default=1.0)
+        parser_g1.add_argument("--affine-scale-jitter", type=float, default=0.3)
+        parser_g1.add_argument("--maxiter", type=int, default=200)
+        parser_g1.add_argument("--restarts", type=int, default=4)
+        parser_g1.add_argument("--folds", type=int, default=5)
+        parser_g1.add_argument("--shots", type=int, default=1024)
+        parser_g1.add_argument("--threshold", type=float, default=0.5)
+        parser_g1.add_argument("--validation-fraction", type=float, default=0.2)
+        parser_g1.add_argument("--max-rows", type=int, default=None)
     report = sub.add_parser(
         "report-test",
         help="Reporting-only evaluation of an artifact on a labelled CSV",
@@ -549,6 +581,11 @@ def main(argv: list[str] | None = None) -> None:
                     folds=args.folds,
                     n_restarts=args.restarts,
                     shots=args.shots,
+                    objective=args.objective,
+                    temperature_start=args.temperature_start,
+                    temperature_stop=args.temperature_stop,
+                    anneal_stages=args.anneal_stages,
+                    stage_maxiter=args.stage_maxiter,
                 )
             )
         )
@@ -677,6 +714,28 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         )
+        return
+    if args.command in ("screen-g1", "cross-validate-g1"):
+        spec = build_g1_spec(args.blocks)
+        config = SpecTrainConfig(
+            train_csv=Path(args.data_dir) / "public_train.csv",
+            artifacts_dir=Path(args.artifacts_dir),
+            label=f"g1b{args.blocks}",
+            seed=args.seed,
+            split_seed=args.split_seed,
+            init_scale=args.init_scale,
+            affine_scale_center=args.affine_scale_center,
+            affine_scale_jitter=args.affine_scale_jitter,
+            maxiter=args.maxiter,
+            n_restarts=args.restarts,
+            folds=args.folds,
+            shots=args.shots,
+            validation_fraction=args.validation_fraction,
+            max_rows=args.max_rows,
+            decision_threshold=args.threshold,
+        )
+        runner = run_spec_screen if args.command == "screen-g1" else run_spec_cross_validation
+        print(runner(spec, config))
         return
     if args.command == "report-test":
         print(

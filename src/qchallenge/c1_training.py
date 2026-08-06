@@ -68,6 +68,11 @@ class C1CrossValidationConfig:
     n_restarts: int = 1
     folds: int = 5
     shots: int = 1024
+    objective: str = "balanced_bce"
+    temperature_start: float = 0.20
+    temperature_stop: float = 0.02
+    anneal_stages: int = 6
+    stage_maxiter: int = 50
 
 
 def c1_random_initial_point(
@@ -430,15 +435,29 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     equivalence_reports: list[dict] = []
 
     for fold_index, (fit, valid) in enumerate(splits):
-        weights, optimization, _ = optimize_c1_quantum_loss(
-            x[fit],
-            y[fit],
+        shared = dict(
             seed=config.init_seed,
             init_scale=config.init_scale,
             affine_scale_jitter=config.affine_scale_jitter,
             maxiter=config.maxiter,
             n_restarts=config.n_restarts,
         )
+        if config.objective == "balanced_bce":
+            weights, optimization, _ = optimize_c1_quantum_loss(
+                x[fit], y[fit], **shared
+            )
+        elif config.objective == "soft_balanced_accuracy":
+            weights, optimization, _ = optimize_c1_soft_balanced_accuracy(
+                x[fit],
+                y[fit],
+                temperature_start=config.temperature_start,
+                temperature_stop=config.temperature_stop,
+                anneal_stages=config.anneal_stages,
+                stage_maxiter=config.stage_maxiter,
+                **shared,
+            )
+        else:
+            raise ValueError(f"Unknown C1 objective: {config.objective!r}")
         probability = c1_exact_probabilities(x[valid], weights)
         oof_probability[valid] = probability
         fold_results.append(
