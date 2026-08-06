@@ -339,9 +339,9 @@ def build_parser() -> argparse.ArgumentParser:
     c1_cv.add_argument("--restarts", type=int, default=1)
     c1_cv.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy"),
+        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc"),
         default="balanced_bce",
-        help="soft_balanced_accuracy warms up on BCE then anneals toward the scored metric.",
+        help="Annealed surrogates warm up on BCE; smooth_auc scores all pairs instead of the threshold band.",
     )
     c1_cv.add_argument("--temperature-start", type=float, default=0.20)
     c1_cv.add_argument("--temperature-stop", type=float, default=0.02)

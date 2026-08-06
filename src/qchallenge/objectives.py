@@ -83,6 +83,74 @@ def soft_balanced_accuracy(
     return loss, derivative
 
 
+def smooth_auc(
+    probability: np.ndarray,
+    labels: np.ndarray,
+    sample_weight: np.ndarray,
+    *,
+    temperature: float = 0.05,
+) -> ObjectiveResult:
+    """Negated smooth ROC AUC and its derivative wrt probability.
+
+    Replaces each pairwise indicator ``1[p_pos > p_neg]`` with
+    ``sigmoid((p_pos - p_neg) / T)`` and averages over all positive/negative
+    pairs.  Unlike the annealed balanced-accuracy surrogate, which concentrates
+    on the shrinking set of rows within ``T`` of the threshold and overfits it,
+    every row keeps a share of the gradient here and no threshold appears at
+    all -- the threshold is chosen afterwards from out-of-fold probabilities.
+
+    ``sample_weight`` is accepted for interface compatibility and unused: AUC is
+    already balanced by construction, since it normalizes over positive/negative
+    pairs rather than over rows.
+
+    Cost is the full ``n_pos * n_neg`` pair set, evaluated exactly.  The
+    rank-based ``O(n log n)`` shortcut applies to the hard indicator, not to a
+    sigmoid of the score difference, so positives are processed in blocks to
+    bound the pair matrix instead.
+    """
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive.")
+    values = np.asarray(probability, dtype=float)
+    positive = values[np.asarray(labels) >= 0.5]
+    negative = values[np.asarray(labels) < 0.5]
+    if len(positive) == 0 or len(negative) == 0:
+        raise ValueError("Both classes must be present for AUC.")
+
+    scaled_positive = positive / temperature
+    scaled_negative = negative / temperature
+    order = np.argsort(scaled_negative, kind="stable")
+    sorted_negative = scaled_negative[order]
+
+    # sigmoid(a - b) = exp(a) / (exp(a) + exp(b)); work in a shifted, stable form
+    # by splitting each pair on which side is larger.
+    total = 0.0
+    gradient_positive = np.zeros(len(positive), dtype=float)
+    gradient_negative = np.zeros(len(negative), dtype=float)
+    # Chunk the positives so the pair matrix stays small but exact.
+    chunk = max(1, 4_000_000 // max(len(negative), 1))
+    for start in range(0, len(positive), chunk):
+        block = scaled_positive[start : start + chunk]
+        difference = block[:, None] - sorted_negative[None, :]
+        sigmoid = np.where(
+            difference >= 0.0,
+            1.0 / (1.0 + np.exp(-np.abs(difference))),
+            np.exp(-np.abs(difference)) / (1.0 + np.exp(-np.abs(difference))),
+        )
+        total += float(np.sum(sigmoid))
+        slope = sigmoid * (1.0 - sigmoid) / temperature
+        gradient_positive[start : start + chunk] = np.sum(slope, axis=1)
+        # ``order`` is a permutation, so plain fancy indexing is safe here.
+        gradient_negative[order] -= np.sum(slope, axis=0)
+
+    pair_count = float(len(positive) * len(negative))
+    loss = -total / pair_count
+    derivative = np.empty(len(values), dtype=float)
+    mask = np.asarray(labels) >= 0.5
+    derivative[mask] = -gradient_positive / pair_count
+    derivative[~mask] = -gradient_negative / pair_count
+    return loss, derivative
+
+
 def temperature_schedule(
     start: float, stop: float, stages: int
 ) -> list[float]:

@@ -23,7 +23,7 @@ import numpy as np
 from qchallenge.c1_simulator import c1_exact_probabilities
 from qchallenge.c1_training import (
     optimize_c1_quantum_loss,
-    optimize_c1_soft_balanced_accuracy,
+    optimize_c1_annealed,
 )
 from qchallenge.data import load_raw_train
 from qchallenge.metrics import balanced_accuracy, balanced_binary_cross_entropy
@@ -72,7 +72,7 @@ def main() -> None:
     )
 
     bce_weights, bce_summary, _ = optimize_c1_quantum_loss(x[fit], y[fit], **shared)
-    soft_weights, soft_summary, _ = optimize_c1_soft_balanced_accuracy(
+    soft_weights, soft_summary, _ = optimize_c1_annealed(
         x[fit],
         y[fit],
         threshold=args.threshold,

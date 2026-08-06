@@ -14,6 +14,7 @@ from scipy.optimize import minimize
 
 from .objectives import (
     balanced_sample_weights,
+    smooth_auc,
     soft_balanced_accuracy,
     temperature_schedule,
 )
@@ -165,7 +166,7 @@ def optimize_c1_quantum_loss(
     }, initial
 
 
-def optimize_c1_soft_balanced_accuracy(
+def optimize_c1_annealed(
     x: np.ndarray,
     y: np.ndarray,
     *,
@@ -173,6 +174,7 @@ def optimize_c1_soft_balanced_accuracy(
     init_scale: float,
     affine_scale_jitter: float,
     maxiter: int,
+    surrogate: str = "soft_balanced_accuracy",
     n_restarts: int = 1,
     threshold: float = FIXED_THRESHOLD,
     temperature_start: float = 0.20,
@@ -180,14 +182,21 @@ def optimize_c1_soft_balanced_accuracy(
     anneal_stages: int = 5,
     stage_maxiter: int = 60,
 ) -> tuple[np.ndarray, dict, np.ndarray]:
-    """Warm up on balanced BCE, then anneal a smooth balanced-accuracy loss.
+    """Warm up on balanced BCE, then anneal a surrogate of the scored metric.
 
-    The soft objective is flat for rows far from the threshold, so optimizing it
-    from a random start would stall.  Starting from the cross-entropy solution
-    and lowering the temperature moves capacity onto the rows near the decision
-    boundary, which are the only ones whose classification can still change.
-    Every stage still reads only circuit probabilities and raw train labels.
+    Both surrogates are flat or nearly flat somewhere, so optimizing either from
+    a random start would stall; starting from the cross-entropy solution and
+    lowering the temperature avoids that.  Every stage still reads only circuit
+    probabilities and raw train labels.
+
+    ``soft_balanced_accuracy`` converges to the scored metric but concentrates
+    on the shrinking set of rows within ``T`` of the threshold, which is why it
+    overfits them.  ``smooth_auc`` instead scores every positive/negative pair,
+    so the gradient stays spread across all rows and no threshold is involved --
+    the threshold is chosen afterwards from out-of-fold probabilities.
     """
+    if surrogate not in ("soft_balanced_accuracy", "smooth_auc"):
+        raise ValueError(f"Unknown C1 surrogate: {surrogate!r}")
     weights, warm_start_summary, initial = optimize_c1_quantum_loss(
         x,
         y,
@@ -205,23 +214,24 @@ def optimize_c1_soft_balanced_accuracy(
     stage_weights: list[list[float]] = [[float(v) for v in weights]]
     stage_temperatures: list[float | None] = [None]
 
-    def soft_accuracy_at(weight_values: np.ndarray, temperature: float) -> float:
+    def build_objective(temperature: float):
+        if surrogate == "smooth_auc":
+            return partial(smooth_auc, temperature=temperature)
+        return partial(
+            soft_balanced_accuracy, threshold=threshold, temperature=temperature
+        )
+
+    def surrogate_value(weight_values: np.ndarray, temperature: float) -> float:
         probability = c1_exact_probabilities(x, weight_values)
-        loss, _ = soft_balanced_accuracy(
-            probability,
-            np.asarray(y, dtype=float),
-            sample_weight,
-            threshold=threshold,
-            temperature=temperature,
+        loss, _ = build_objective(temperature)(
+            probability, np.asarray(y, dtype=float), sample_weight
         )
         return -loss
 
     for temperature in temperature_schedule(
         temperature_start, temperature_stop, anneal_stages
     ):
-        objective = partial(
-            soft_balanced_accuracy, threshold=threshold, temperature=temperature
-        )
+        objective = build_objective(temperature)
         before = balanced_accuracy(
             y, (c1_exact_probabilities(x, weights) >= threshold).astype(int)
         )
@@ -237,7 +247,7 @@ def optimize_c1_soft_balanced_accuracy(
         stages.append(
             {
                 "temperature": float(temperature),
-                "soft_balanced_accuracy": soft_accuracy_at(weights, temperature),
+                "surrogate_value": surrogate_value(weights, temperature),
                 "train_balanced_accuracy_before": before,
                 "train_balanced_accuracy_after": balanced_accuracy(
                     y, (c1_exact_probabilities(x, weights) >= threshold).astype(int)
@@ -253,7 +263,7 @@ def optimize_c1_soft_balanced_accuracy(
         "optimizer": "L-BFGS-B_with_exact_adjoint_gradient",
         "training_emulator": "vectorized_exact_4_qubit_statevector",
         "qiskit_equivalence_required": True,
-        "objective": "balanced_bce_warm_start_then_annealed_soft_balanced_accuracy",
+        "objective": f"balanced_bce_warm_start_then_annealed_{surrogate}",
         "anneal_threshold": float(threshold),
         "anneal_stages": stages,
         "stage_weights": stage_weights,
@@ -457,10 +467,11 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
             weights, optimization, _ = optimize_c1_quantum_loss(
                 x[fit], y[fit], **shared
             )
-        elif config.objective == "soft_balanced_accuracy":
-            weights, optimization, _ = optimize_c1_soft_balanced_accuracy(
+        elif config.objective in ("soft_balanced_accuracy", "smooth_auc"):
+            weights, optimization, _ = optimize_c1_annealed(
                 x[fit],
                 y[fit],
+                surrogate=config.objective,
                 temperature_start=config.temperature_start,
                 temperature_stop=config.temperature_stop,
                 anneal_stages=config.anneal_stages,
@@ -532,6 +543,14 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
                     "stage": position,
                     "temperature": stage_temperatures[position],
                     "is_warm_start_only": position == 0,
+                    # Per fold, so a gain can be checked for consistency rather
+                    # than read off a single pooled number.
+                    "per_fold_balanced_accuracy_at_selected_threshold": [
+                        balanced_accuracy(
+                            y[valid_rows], probabilities[valid_rows] >= threshold_grid[best]
+                        )
+                        for _, valid_rows in splits
+                    ],
                     "balanced_accuracy_at_0_5": balanced_accuracy(
                         y, probabilities >= 0.5
                     ),
