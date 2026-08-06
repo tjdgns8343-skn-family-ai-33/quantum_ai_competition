@@ -624,3 +624,150 @@ def run_spec_cross_validation(spec: CircuitSpec, config: SpecTrainConfig) -> Pat
         json.dumps(payload, indent=2), encoding="utf-8"
     )
     return run_dir
+
+
+def run_spec_final(spec: CircuitSpec, config: SpecTrainConfig, select_stage: int) -> Path:
+    """Train on the whole train set and package the chosen annealing stage.
+
+    Annealing is a path rather than a point, so the full schedule is replayed
+    and the weights are lifted from the stage that train-only screening chose.
+    """
+    from qiskit import qasm3
+
+    from .encoding_note import build_encoding_note
+    from .gatespec import constraint_report
+
+    x, y, data_info = load_raw_train(config.train_csv)
+    weights, optimization, _ = optimize_spec_annealed(
+        spec,
+        x,
+        y,
+        surrogate=config.objective,
+        seed=config.seed,
+        init_scale=config.init_scale,
+        affine_scale_center=config.affine_scale_center,
+        affine_scale_jitter=config.affine_scale_jitter,
+        maxiter=config.maxiter,
+        n_restarts=config.n_restarts,
+        threshold=config.decision_threshold,
+        temperature_start=config.temperature_start,
+        temperature_stop=config.temperature_stop,
+        anneal_stages=config.anneal_stages,
+        stage_maxiter=config.stage_maxiter,
+    )
+    stage_weights = optimization.pop("stage_weights")
+    if not 0 <= select_stage < len(stage_weights):
+        raise ValueError(f"select_stage must be in 0..{len(stage_weights) - 1}.")
+    weights = np.asarray(stage_weights[select_stage], dtype=float)
+
+    run_dir = config.artifacts_dir / (
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_final_{config.label}"
+    )
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    circuit, _, _ = build_circuit(spec, measured=True)
+    constraint = constraint_report(circuit)
+    if not constraint["passes"]:
+        raise ValueError(f"Circuit constraint failure: {constraint}")
+    columns = ", ".join(f"x{i + 1}" for i in spec.used_features())
+    (run_dir / "classifier.qasm").write_text(
+        f"// raw {columns} enter only single-feature affine RY/RZ gates; "
+        "no preprocessing or augmentation.\n" + qasm3.dumps(circuit),
+        encoding="utf-8",
+    )
+    (run_dir / "weights.json").write_text(
+        json.dumps(
+            {
+                **{f"theta_{i}": float(v) for i, v in enumerate(weights)},
+                "threshold": config.decision_threshold,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    feature_uses = {name: int(n) for name, n in spec.feature_uses().items()}
+    annealing = {
+        "temperature_start": config.temperature_start,
+        "temperature_stop": config.temperature_stop,
+        "stages": config.anneal_stages,
+        "submitted_stage": select_stage,
+        "stage_and_temperature_selection": (
+            "train-only holdout on public_train.csv; public_test.csv was not used"
+        ),
+    }
+    provenance = {
+        "architecture": spec.name,
+        "weight_count": spec.n_weights,
+        "parameter_generation": "label_independent_random_initialization_then_direct_quantum_probability_gradient_optimization",
+        "initialization": {"seed": config.seed, "label_dependent": False},
+        "training_quantum_emulator": "vectorized exact statevector verified against qiskit.quantum_info.Statevector",
+        "loss_source": "circuit readout probability versus raw public_train label",
+        "loss_inputs": "circuit readout probability and raw public_train label only",
+        "annealing": annealing,
+        "optimizer": "L-BFGS-B with exact adjoint quantum-circuit gradient",
+        "selected_raw_features_zero_based": list(spec.used_features()),
+        "expected_feature_uses": feature_uses,
+        "feature_processing": "none",
+        "single_feature_affine_encoding": True,
+        "classical_predictive_model": None,
+        "surrogate_model": None,
+        "teacher_model": None,
+        "warm_start": False,
+        "transferred_coefficients": False,
+        "decision_threshold": {
+            "value": config.decision_threshold,
+            "selection": "train_only_holdout_quantum_probabilities",
+        },
+    }
+    (run_dir / "parameter_provenance.json").write_text(
+        json.dumps(provenance, indent=2), encoding="utf-8"
+    )
+    (run_dir / "training_metrics.json").write_text(
+        json.dumps(
+            {
+                "architecture": spec.name,
+                "config": _payload_config(config),
+                "data": data_info,
+                "optimization": optimization,
+                "constraint_report": constraint,
+                "full_train_metrics": metrics(
+                    spec, x, y, weights, shots=config.shots,
+                    seed=config.seed + 1, threshold=config.decision_threshold,
+                ),
+                "qiskit_equivalence": qiskit_equivalence_report(spec, x, weights),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "encoding_note.txt").write_text(
+        build_encoding_note(
+            architecture=spec.name,
+            encoding_description=(
+                "Each raw feature enters as one RY rotation per upload, "
+                "RY(theta_scale * x_i + theta_bias), carrying a single raw feature."
+            ),
+            entanglement_description=(
+                "Each block applies trainable RZ and RY mixers, then the entangling "
+                "layer; a final trainable RY on the readout qubit turns accumulated "
+                "phase into a Z-basis probability."
+            ),
+            readout_qubit=spec.readout_qubit,
+            used_features=spec.used_features(),
+            uploads_per_feature=feature_uses,
+            qubits=constraint["qubits"],
+            depth=constraint["depth"],
+            two_qubit_gates=constraint["two_qubit_gate_count"],
+            weight_count=spec.n_weights,
+            objective=config.objective,
+            threshold=config.decision_threshold,
+            threshold_source="balanced accuracy of a train-only holdout on public_train.csv",
+            initialization=(
+                f"Every theta starts from a label-independent uniform random draw "
+                f"with seed {config.seed}; nothing about the labels enters it."
+            ),
+            annealing=annealing,
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
