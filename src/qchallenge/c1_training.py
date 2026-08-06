@@ -199,6 +199,11 @@ def optimize_c1_soft_balanced_accuracy(
     )
     sample_weight = balanced_sample_weights(np.asarray(y, dtype=int))
     stages: list[dict] = []
+    # Stage 0 is the cross-entropy warm start, so a caller can read the whole
+    # temperature curve -- including "no annealing at all" -- from one run and
+    # pick the stop temperature on out-of-fold data rather than on train.
+    stage_weights: list[list[float]] = [[float(v) for v in weights]]
+    stage_temperatures: list[float | None] = [None]
 
     def soft_accuracy_at(weight_values: np.ndarray, temperature: float) -> float:
         probability = c1_exact_probabilities(x, weight_values)
@@ -241,6 +246,8 @@ def optimize_c1_soft_balanced_accuracy(
                 "message": str(result.message),
             }
         )
+        stage_weights.append([float(value) for value in weights])
+        stage_temperatures.append(float(temperature))
 
     return weights, {
         "optimizer": "L-BFGS-B_with_exact_adjoint_gradient",
@@ -249,6 +256,8 @@ def optimize_c1_soft_balanced_accuracy(
         "objective": "balanced_bce_warm_start_then_annealed_soft_balanced_accuracy",
         "anneal_threshold": float(threshold),
         "anneal_stages": stages,
+        "stage_weights": stage_weights,
+        "stage_temperatures": stage_temperatures,
         "warm_start": warm_start_summary,
         "history": warm_start_summary.get("history", []),
         "best_observed_loss": warm_start_summary.get("best_observed_loss"),
@@ -432,6 +441,8 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     splits = _stratified_folds(y, config.folds, config.split_seed)
     oof_probability = np.full(len(y), np.nan, dtype=float)
     fold_results: list[dict] = []
+    stage_oof: list[np.ndarray] | None = None
+    stage_temperatures: list[float | None] = []
     equivalence_reports: list[dict] = []
 
     for fold_index, (fit, valid) in enumerate(splits):
@@ -458,6 +469,23 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
             )
         else:
             raise ValueError(f"Unknown C1 objective: {config.objective!r}")
+        if "stage_weights" in optimization:
+            if stage_oof is None:
+                stage_oof = [
+                    np.full(len(y), np.nan, dtype=float)
+                    for _ in optimization["stage_weights"]
+                ]
+                stage_temperatures = optimization["stage_temperatures"]
+            for position, values in enumerate(optimization["stage_weights"]):
+                stage_oof[position][valid] = c1_exact_probabilities(
+                    x[valid], np.asarray(values, dtype=float)
+                )
+            # The per-fold weight dump is large and already summarized.
+            optimization = {
+                key: value
+                for key, value in optimization.items()
+                if key != "stage_weights"
+            }
         probability = c1_exact_probabilities(x[valid], weights)
         oof_probability[valid] = probability
         fold_results.append(
@@ -487,6 +515,37 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     rng = np.random.default_rng(config.split_seed + 1000)
     shot_probability = rng.binomial(config.shots, oof_probability) / config.shots
 
+    # Out-of-fold score at every annealing temperature, so the stop temperature
+    # is chosen on held-out rows instead of on the training fit it overfits.
+    temperature_curve: list[dict] = []
+    if stage_oof is not None:
+        for position, probabilities in enumerate(stage_oof):
+            if not np.isfinite(probabilities).all():
+                raise RuntimeError("Stage OOF generation left rows unpredicted.")
+            scores = np.asarray(
+                [balanced_accuracy(y, probabilities >= t) for t in threshold_grid]
+            )
+            best = int(np.argmax(scores))
+            shot = rng.binomial(config.shots, probabilities) / config.shots
+            temperature_curve.append(
+                {
+                    "stage": position,
+                    "temperature": stage_temperatures[position],
+                    "is_warm_start_only": position == 0,
+                    "balanced_accuracy_at_0_5": balanced_accuracy(
+                        y, probabilities >= 0.5
+                    ),
+                    "selected_threshold": float(threshold_grid[best]),
+                    "balanced_accuracy_at_selected_threshold": float(scores[best]),
+                    "shot_balanced_accuracy_at_selected_threshold": balanced_accuracy(
+                        y, shot >= threshold_grid[best]
+                    ),
+                    "balanced_binary_cross_entropy": balanced_binary_cross_entropy(
+                        y, probabilities
+                    ),
+                }
+            )
+
     run_dir = config.artifacts_dir / (
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_cv_c1_"
         f"split{config.split_seed}_init{config.init_seed}"
@@ -514,6 +573,7 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
         "balanced_binary_cross_entropy": balanced_binary_cross_entropy(
             y, oof_probability
         ),
+        "annealing_temperature_curve": temperature_curve,
         "fold_results": fold_results,
         "qiskit_equivalence_reports": equivalence_reports,
         "threshold_grid": [
