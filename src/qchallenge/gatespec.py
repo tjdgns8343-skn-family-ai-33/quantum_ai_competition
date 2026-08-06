@@ -24,6 +24,8 @@ from .circuit import ALLOWED_GATES
 
 ROTATIONS = ("ry", "rz")
 ENTANGLERS = ("cx", "cz")
+# Fixed single-qubit gates carry no parameter and no feature.
+FIXED = ("h",)
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,12 @@ def validate(spec: CircuitSpec) -> None:
             ):
                 raise ValueError(f"{spec.name}: {label} qubit outside the register.")
             continue
+        if gate.kind in FIXED:
+            if gate.qubit is None or not 0 <= gate.qubit < spec.n_qubits:
+                raise ValueError(f"{spec.name}: {gate.kind} qubit outside the register.")
+            if gate.is_data or gate.param_index is not None:
+                raise ValueError(f"{spec.name}: {gate.kind} takes no parameter.")
+            continue
         if gate.kind not in ROTATIONS:
             raise ValueError(f"{spec.name}: unsupported gate {gate.kind!r}.")
         if gate.qubit is None or not 0 <= gate.qubit < spec.n_qubits:
@@ -124,6 +132,9 @@ def build_circuit(spec: CircuitSpec, *, measured: bool = False) -> tuple[
     for gate in spec.gates:
         if gate.kind in ENTANGLERS:
             getattr(circuit, gate.kind)(gate.control, gate.target)
+            continue
+        if gate.kind in FIXED:
+            getattr(circuit, gate.kind)(gate.qubit)
             continue
         if gate.is_data:
             angle = (

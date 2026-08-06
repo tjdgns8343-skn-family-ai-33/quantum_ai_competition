@@ -215,3 +215,135 @@ def build_candidate(name: str) -> CircuitSpec:
             f"Unknown candidate {name!r}; available: {', '.join(sorted(CANDIDATES))}"
         )
     return CANDIDATES[name]()
+
+
+# --- Phase encoding -----------------------------------------------------
+#
+# Every architecture tried so far encodes into amplitude with RY, because RZ on
+# |0> is only a global phase and so the first data gate had to be RY.  Putting H
+# first makes |+>, and RZ then encodes into phase instead.  Three reasons to
+# expect something different from it:
+#
+#   * The organizers already scaled each PCA component into [-pi, pi], so the
+#     features are angle-valued and phase is their natural home.
+#   * CZ beat CX under plain cross-entropy (OOF 0.8110 against 0.8050).  CZ is
+#     diagonal, which is the matching entangler for phase encoding; pairing it
+#     with amplitude encoding may be why it did not carry through.
+#   * RZ and CZ all commute, so the diagonal part of a block is a single
+#     commuting unitary, and pairwise terms in cos(x_i +/- x_j) appear directly
+#     in the exponent instead of being assembled indirectly through CX.
+#
+# Every rotation still carries one raw feature in the permitted affine form; the
+# CZ coupling strength is fixed by the gate, not by a two-feature angle.
+ALL_PAIRS_4 = (
+    ("cz", 0, 1), ("cz", 2, 3),
+    ("cz", 0, 2), ("cz", 1, 3),
+    ("cz", 0, 3), ("cz", 1, 2),
+)
+CZ_TREE_4 = (("cz", 1, 0), ("cz", 3, 2), ("cz", 2, 0))
+
+
+def phase_encoded(
+    blocks: Sequence[Sequence[int]],
+    *,
+    entangler: Sequence[tuple[str, int, int]] = ALL_PAIRS_4,
+    name: str = "candidate_ph_phase_encoded",
+) -> CircuitSpec:
+    """H, then RZ data encoding, then a diagonal entangler, then H and mixers."""
+    gates: list[Gate] = []
+    cursor = 0
+    n_qubits = len(blocks[0])
+    for block_features in blocks:
+        for qubit in range(n_qubits):
+            gates.append(Gate(kind="h", qubit=qubit))
+        for qubit, feature in enumerate(block_features):
+            gates.append(
+                Gate(
+                    kind="rz",
+                    qubit=qubit,
+                    feature=feature,
+                    scale_index=cursor,
+                    bias_index=cursor + 1,
+                )
+            )
+            cursor += 2
+        for kind, control, target in entangler:
+            gates.append(Gate(kind=kind, control=control, target=target))
+        for qubit in range(n_qubits):
+            gates.append(Gate(kind="h", qubit=qubit))
+        for kind in ("rz", "ry"):
+            for qubit in range(n_qubits):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=name,
+        n_qubits=n_qubits,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+# Same feature layout as C1 so the comparison isolates the encoding.
+PH_BLOCKS_4 = ((0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 2, 3), (4, 5, 6, 7))
+PH_BLOCKS_6 = PH_BLOCKS_4 + ((0, 1, 2, 3), (4, 5, 6, 7))
+
+CANDIDATES.update(
+    {
+        "ph4": lambda: phase_encoded(PH_BLOCKS_4, name="candidate_ph4_all_pairs"),
+        "ph6": lambda: phase_encoded(PH_BLOCKS_6, name="candidate_ph6_all_pairs"),
+        "ph4tree": lambda: phase_encoded(
+            PH_BLOCKS_4, entangler=CZ_TREE_4, name="candidate_ph4_tree"
+        ),
+    }
+)
+
+
+def phase_amplitude_hybrid(n_pairs: int = 2) -> CircuitSpec:
+    """Alternate a phase-encoded block with an amplitude-encoded one.
+
+    Phase and amplitude encoding reach different function classes, and nothing
+    forces a circuit to pick one.  Interleaving lets the readout combine both
+    without spending more parameters per block than either alone.
+    """
+    gates: list[Gate] = []
+    cursor = 0
+    for pair in range(n_pairs):
+        for features, phase in ((PH_BLOCKS_4[0], True), (PH_BLOCKS_4[1], False)):
+            if phase:
+                for qubit in range(N_QUBITS):
+                    gates.append(Gate(kind="h", qubit=qubit))
+            for qubit, feature in enumerate(features):
+                gates.append(
+                    Gate(
+                        kind="rz" if phase else "ry",
+                        qubit=qubit,
+                        feature=feature,
+                        scale_index=cursor,
+                        bias_index=cursor + 1,
+                    )
+                )
+                cursor += 2
+            for kind, control, target in (CZ_TREE_4 if phase else CX_TREE):
+                gates.append(Gate(kind=kind, control=control, target=target))
+            if phase:
+                for qubit in range(N_QUBITS):
+                    gates.append(Gate(kind="h", qubit=qubit))
+            for kind in ("rz", "ry"):
+                for qubit in range(N_QUBITS):
+                    gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                    cursor += 1
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_phmix_p{n_pairs}",
+        n_qubits=N_QUBITS,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+CANDIDATES.update({"phmix2": lambda: phase_amplitude_hybrid(2)})

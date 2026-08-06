@@ -59,6 +59,20 @@ def _apply_rz(state, angle, axis, *, inverse=False):
     return state
 
 
+_INV_SQRT2 = 1.0 / np.sqrt(2.0)
+
+
+def _apply_h(state, axis):
+    """Hadamard is its own inverse, so the same routine undoes it."""
+    a0 = _half(state, axis, 0)
+    a1 = _half(state, axis, 1)
+    new0 = (a0 + a1) * _INV_SQRT2
+    new1 = (a0 - a1) * _INV_SQRT2
+    a0[...] = new0
+    a1[...] = new1
+    return state
+
+
 def _apply_cx(state, control_axis, target_axis):
     """CX is its own inverse, so the same routine undoes it."""
     branch = _half(state, control_axis, 1)
@@ -116,6 +130,9 @@ def _plan(spec: CircuitSpec, features: np.ndarray, weights: np.ndarray) -> list:
                 )
             )
             continue
+        if gate.kind == "h":
+            plan.append(("h", _axis(spec, gate.qubit), None, None, ()))
+            continue
         axis = _axis(spec, gate.qubit)
         if gate.is_data:
             column = np.ascontiguousarray(features[:, gate.feature])
@@ -144,6 +161,8 @@ def _forward(spec, features, weights):
             _apply_cx(state, first, second)
         elif kind == "cz":
             _apply_cz(state, first, second)
+        elif kind == "h":
+            _apply_h(state, first)
         elif kind == "ry":
             _apply_ry(state, angle, first)
         else:
@@ -202,6 +221,10 @@ def _chunk_gradient(spec, features, weights, dloss_dexpectation):
             apply_entangler = _apply_cx if kind == "cx" else _apply_cz
             apply_entangler(state, first, second)
             apply_entangler(adjoint, first, second)
+            continue
+        if kind == "h":
+            _apply_h(state, first)
+            _apply_h(adjoint, first)
             continue
         if kind == "ry":
             _apply_ry(state, angle, first, inverse=True)
