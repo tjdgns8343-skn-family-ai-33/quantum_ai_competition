@@ -39,7 +39,15 @@ from .e1s_training import (
     run_e1s_cross_validation,
     run_e1s_screen,
 )
+from .f1_training import (
+    F1CrossValidationConfig,
+    F1TrainConfig,
+    run_f1_cross_validation,
+    run_f1_final,
+    run_f1_screen,
+)
 from .compliance import audit_artifact, audit_source
+from .evaluate import evaluate_artifact_on_csv
 from .circuit import FEATURE_LAYOUTS
 from .feature_search import FeatureSearchConfig, run_feature_search
 from .training import TrainConfig, run_final, run_screen
@@ -96,6 +104,12 @@ def _add_c1_training_args(parser: argparse.ArgumentParser, *, validation: bool) 
     parser.add_argument("--maxiter", type=int, default=80)
     parser.add_argument("--shots", type=int, default=1024)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--restarts",
+        type=int,
+        default=1,
+        help="Label-independent random restarts; the lowest training loss wins.",
+    )
     if validation:
         parser.add_argument("--validation-fraction", type=float, default=0.2)
         parser.add_argument(
@@ -120,6 +134,7 @@ def _c1_config(args: argparse.Namespace, *, validation: bool) -> C1TrainConfig:
         validation_fraction=getattr(args, "validation_fraction", 0.2),
         max_rows=getattr(args, "max_rows", None) if validation else None,
         decision_threshold=args.threshold,
+        n_restarts=getattr(args, "restarts", 1),
     )
 
 
@@ -254,6 +269,40 @@ def _e1s_config(args: argparse.Namespace, *, validation: bool) -> E1STrainConfig
     )
 
 
+def _f1_config(args: argparse.Namespace, *, validation: bool) -> F1TrainConfig:
+    init_seed = getattr(args, "init_seed", None)
+    return F1TrainConfig(
+        train_csv=Path(args.data_dir) / "public_train.csv",
+        artifacts_dir=Path(args.artifacts_dir),
+        seed=args.seed if init_seed is None else init_seed,
+        split_seed=getattr(args, "split_seed", None),
+        n_blocks=args.blocks,
+        init_scale=args.init_scale,
+        affine_scale_center=args.affine_scale_center,
+        affine_scale_jitter=args.affine_scale_jitter,
+        maxiter=args.maxiter,
+        shots=args.shots,
+        validation_fraction=getattr(args, "validation_fraction", 0.2),
+        max_rows=getattr(args, "max_rows", None) if validation else None,
+        decision_threshold=args.threshold,
+        n_restarts=getattr(args, "restarts", 1),
+    )
+
+
+def _add_f1_training_args(parser: argparse.ArgumentParser, *, validation: bool) -> None:
+    _add_c1_training_args(parser, validation=validation)
+    parser.set_defaults(maxiter=200)
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=8,
+        help="Re-uploading blocks; 8 fills the depth-50 and 80 two-qubit-gate budget.",
+    )
+    parser.add_argument("--affine-scale-center", type=float, default=1.0)
+    parser.add_argument("--split-seed", type=int, default=None)
+    parser.add_argument("--init-seed", type=int, default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -285,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     c1_cv.add_argument("--affine-scale-jitter", type=float, default=0.1)
     c1_cv.add_argument("--maxiter", type=int, default=80)
     c1_cv.add_argument("--folds", type=int, default=5)
+    c1_cv.add_argument("--restarts", type=int, default=1)
     c1_cv.add_argument("--shots", type=int, default=1024)
     c1o_screen = sub.add_parser(
         "screen-c1o",
@@ -409,6 +459,32 @@ def build_parser() -> argparse.ArgumentParser:
     e1s_cv.add_argument("--folds", type=int, default=5)
     e1s_cv.add_argument("--shots", type=int, default=1024)
     c3_screen.set_defaults(maxiter=60)
+    f1_screen = sub.add_parser(
+        "screen-f1",
+        help="Train/evaluate the eight-qubit tree-funnel F1 VQC",
+    )
+    _add_f1_training_args(f1_screen, validation=True)
+    f1_final = sub.add_parser(
+        "train-final-f1",
+        help="Train F1 directly on the complete public train set",
+    )
+    _add_f1_training_args(f1_final, validation=False)
+    f1_cv = sub.add_parser(
+        "cross-validate-f1",
+        help="Generate F1 quantum-only OOF probabilities and threshold",
+    )
+    f1_cv.add_argument("--data-dir", default="raw")
+    f1_cv.add_argument("--artifacts-dir", default="artifacts")
+    f1_cv.add_argument("--split-seed", type=int, default=2026)
+    f1_cv.add_argument("--init-seed", type=int, default=2026)
+    f1_cv.add_argument("--blocks", type=int, default=8)
+    f1_cv.add_argument("--init-scale", type=float, default=0.05)
+    f1_cv.add_argument("--affine-scale-center", type=float, default=1.0)
+    f1_cv.add_argument("--affine-scale-jitter", type=float, default=0.1)
+    f1_cv.add_argument("--maxiter", type=int, default=200)
+    f1_cv.add_argument("--folds", type=int, default=5)
+    f1_cv.add_argument("--restarts", type=int, default=1)
+    f1_cv.add_argument("--shots", type=int, default=1024)
     search = sub.add_parser(
         "search-features",
         help="Quantum-only forward beam search over packed raw features",
@@ -425,6 +501,15 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--feature-layout", choices=tuple(FEATURE_LAYOUTS), default="sequential"
     )
+    report = sub.add_parser(
+        "report-test",
+        help="Reporting-only evaluation of an artifact on a labelled CSV",
+    )
+    report.add_argument("--artifact-dir", required=True)
+    report.add_argument("--data-dir", default="raw")
+    report.add_argument("--csv-name", default="public_test.csv")
+    report.add_argument("--shots", type=int, default=1024)
+    report.add_argument("--threshold", type=float, default=None)
     source = sub.add_parser("audit-source", help="Reject known classical predictive-model code")
     source.add_argument("--source-root", default="src")
     artifact = sub.add_parser("audit-artifact", help="Audit a completed final artifact")
@@ -462,6 +547,7 @@ def main(argv: list[str] | None = None) -> None:
                     affine_scale_jitter=args.affine_scale_jitter,
                     maxiter=args.maxiter,
                     folds=args.folds,
+                    n_restarts=args.restarts,
                     shots=args.shots,
                 )
             )
@@ -548,6 +634,32 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         return
+    if args.command == "screen-f1":
+        print(run_f1_screen(_f1_config(args, validation=True)))
+        return
+    if args.command == "train-final-f1":
+        print(run_f1_final(_f1_config(args, validation=False)))
+        return
+    if args.command == "cross-validate-f1":
+        print(
+            run_f1_cross_validation(
+                F1CrossValidationConfig(
+                    train_csv=Path(args.data_dir) / "public_train.csv",
+                    artifacts_dir=Path(args.artifacts_dir),
+                    split_seed=args.split_seed,
+                    init_seed=args.init_seed,
+                    n_blocks=args.blocks,
+                    init_scale=args.init_scale,
+                    affine_scale_center=args.affine_scale_center,
+                    affine_scale_jitter=args.affine_scale_jitter,
+                    maxiter=args.maxiter,
+                    folds=args.folds,
+                    n_restarts=args.restarts,
+                    shots=args.shots,
+                )
+            )
+        )
+        return
     if args.command == "search-features":
         print(
             run_feature_search(
@@ -563,6 +675,19 @@ def main(argv: list[str] | None = None) -> None:
                     max_features=args.max_features,
                     feature_layout=args.feature_layout,
                 )
+            )
+        )
+        return
+    if args.command == "report-test":
+        print(
+            json.dumps(
+                evaluate_artifact_on_csv(
+                    Path(args.artifact_dir),
+                    Path(args.data_dir) / args.csv_name,
+                    shots=args.shots,
+                    threshold=args.threshold,
+                ),
+                indent=2,
             )
         )
         return

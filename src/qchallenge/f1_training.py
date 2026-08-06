@@ -1,37 +1,32 @@
-"""End-to-end training for the compliant C1 quantum circuit."""
+"""End-to-end training for the compliant F1 eight-qubit quantum circuit."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 
 import numpy as np
 from qiskit.quantum_info import Statevector
-from scipy.optimize import minimize
 
-from .objectives import (
-    balanced_sample_weights,
-    soft_balanced_accuracy,
-    temperature_schedule,
-)
 from .restarts import multistart_minimize, restart_seeds
-from .c1_circuit import (
-    C1_ARCHITECTURE,
-    C1_N_FEATURES,
-    C1_N_WEIGHTS,
-    C1_REUPLOAD_BLOCKS,
-    build_c1_unitary,
-    export_c1_submission_qasm,
-)
-from .c1_simulator import (
-    c1_balanced_bce_value_and_gradient,
-    c1_exact_probabilities,
-    c1_value_and_gradient,
-)
 from .data import load_raw_train
+from .f1_circuit import (
+    F1_ARCHITECTURE,
+    F1_DEFAULT_BLOCKS,
+    F1_N_FEATURES,
+    F1_N_QUBITS,
+    F1_PARAMETERS_PER_BLOCK,
+    build_f1_unitary,
+    export_f1_submission_qasm,
+    f1_reupload_blocks,
+    f1_weight_count,
+)
+from .f1_simulator import (
+    f1_balanced_bce_value_and_gradient,
+    f1_exact_probabilities,
+)
 from .metrics import (
     balanced_accuracy,
     balanced_binary_cross_entropy,
@@ -41,14 +36,16 @@ from .training import FIXED_THRESHOLD, stratified_holdout
 
 
 @dataclass(frozen=True)
-class C1TrainConfig:
+class F1TrainConfig:
     train_csv: Path
     artifacts_dir: Path = Path("artifacts")
     seed: int = 2026
     split_seed: int | None = None
+    n_blocks: int = F1_DEFAULT_BLOCKS
     init_scale: float = 0.05
+    affine_scale_center: float = 1.0
     affine_scale_jitter: float = 0.1
-    maxiter: int = 80
+    maxiter: int = 200
     n_restarts: int = 1
     shots: int = 1024
     validation_fraction: float = 0.2
@@ -57,33 +54,44 @@ class C1TrainConfig:
 
 
 @dataclass(frozen=True)
-class C1CrossValidationConfig:
+class F1CrossValidationConfig:
     train_csv: Path
     artifacts_dir: Path = Path("artifacts")
     split_seed: int = 2026
     init_seed: int = 2026
+    n_blocks: int = F1_DEFAULT_BLOCKS
     init_scale: float = 0.05
+    affine_scale_center: float = 1.0
     affine_scale_jitter: float = 0.1
-    maxiter: int = 80
+    maxiter: int = 200
     n_restarts: int = 1
     folds: int = 5
     shots: int = 1024
 
 
-def c1_random_initial_point(
-    seed: int, *, local_scale: float, affine_scale_jitter: float
+def f1_random_initial_point(
+    seed: int,
+    *,
+    local_scale: float,
+    affine_scale_jitter: float,
+    affine_scale_center: float = 1.0,
+    n_blocks: int = F1_DEFAULT_BLOCKS,
 ) -> np.ndarray:
-    """Label-independent initialization around direct raw-angle encoding."""
+    """Label-independent initialization around direct raw-angle encoding.
+
+    Mixers start near identity, which keeps the deep circuit away from the
+    barren-plateau regime that uniformly random angles would produce.
+    """
     if local_scale < 0 or affine_scale_jitter < 0:
-        raise ValueError("C1 initialization scales must be non-negative.")
+        raise ValueError("F1 initialization scales must be non-negative.")
     rng = np.random.default_rng(seed)
-    weights = rng.uniform(-local_scale, local_scale, C1_N_WEIGHTS)
-    for block_index in range(len(C1_REUPLOAD_BLOCKS)):
-        offset = 16 * block_index
-        weights[offset : offset + 4] = rng.uniform(
-            1.0 - affine_scale_jitter,
-            1.0 + affine_scale_jitter,
-            4,
+    weights = rng.uniform(-local_scale, local_scale, f1_weight_count(n_blocks))
+    for block_index in range(n_blocks):
+        offset = F1_PARAMETERS_PER_BLOCK * block_index
+        weights[offset : offset + F1_N_QUBITS] = rng.uniform(
+            affine_scale_center - affine_scale_jitter,
+            affine_scale_center + affine_scale_jitter,
+            F1_N_QUBITS,
         )
     return weights
 
@@ -94,7 +102,7 @@ def _stratified_subsample(
     if max_rows is None or max_rows >= len(y):
         return np.arange(len(y), dtype=int)
     if max_rows < 20:
-        raise ValueError("C1 max_rows must be at least 20.")
+        raise ValueError("F1 max_rows must be at least 20.")
     rng = np.random.default_rng(seed)
     parts: list[np.ndarray] = []
     remaining = max_rows
@@ -110,144 +118,59 @@ def _stratified_subsample(
     return np.sort(np.concatenate(parts))
 
 
-def _c1_bounds() -> list[tuple[float, float]]:
-    bounds = [(-np.pi, np.pi) for _ in range(C1_N_WEIGHTS)]
-    for block_index in range(len(C1_REUPLOAD_BLOCKS)):
-        offset = 16 * block_index
-        for qubit in range(4):
+def _f1_bounds(n_blocks: int) -> list[tuple[float, float]]:
+    bounds = [(-np.pi, np.pi) for _ in range(f1_weight_count(n_blocks))]
+    for block_index in range(n_blocks):
+        offset = F1_PARAMETERS_PER_BLOCK * block_index
+        for qubit in range(F1_N_QUBITS):
             bounds[offset + qubit] = (-3.0, 3.0)
     return bounds
 
 
-def optimize_c1_quantum_loss(
+def optimize_f1_quantum_loss(
     x: np.ndarray,
     y: np.ndarray,
     *,
     seed: int,
+    n_blocks: int,
     init_scale: float,
+    affine_scale_center: float,
     affine_scale_jitter: float,
     maxiter: int,
     n_restarts: int = 1,
     restart_seed_stride: int = 1000,
 ) -> tuple[np.ndarray, dict, np.ndarray]:
-    """Optimize analytic gradients of the C1 statevector probability only."""
+    """Optimize analytic gradients of the F1 statevector probability only."""
     seeds = restart_seeds(seed, n_restarts, restart_seed_stride)
     initial_points = [
-        c1_random_initial_point(
+        f1_random_initial_point(
             restart_seed,
             local_scale=init_scale,
             affine_scale_jitter=affine_scale_jitter,
+            affine_scale_center=affine_scale_center,
+            n_blocks=n_blocks,
         )
         for restart_seed in seeds
     ]
 
     def value_and_gradient(weight_values: np.ndarray) -> tuple[float, np.ndarray]:
-        return c1_balanced_bce_value_and_gradient(x, y, weight_values)
+        return f1_balanced_bce_value_and_gradient(x, y, weight_values, n_blocks)
 
     weights, initial, summary = multistart_minimize(
         value_and_gradient,
         initial_points,
-        bounds=_c1_bounds(),
+        bounds=_f1_bounds(n_blocks),
         maxiter=maxiter,
     )
     return weights, {
         "optimizer": "L-BFGS-B_with_exact_adjoint_gradient",
-        "training_emulator": "vectorized_exact_4_qubit_statevector",
+        "training_emulator": "vectorized_exact_8_qubit_statevector",
         "qiskit_equivalence_required": True,
-        "objective": "balanced_binary_cross_entropy_of_C1_q0_probability",
+        "objective": "balanced_binary_cross_entropy_of_F1_q0_probability",
+        "n_blocks": int(n_blocks),
+        "weight_count": f1_weight_count(n_blocks),
         "restart_seeds": seeds,
         **summary,
-    }, initial
-
-
-def optimize_c1_soft_balanced_accuracy(
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    seed: int,
-    init_scale: float,
-    affine_scale_jitter: float,
-    maxiter: int,
-    n_restarts: int = 1,
-    threshold: float = FIXED_THRESHOLD,
-    temperature_start: float = 0.20,
-    temperature_stop: float = 0.02,
-    anneal_stages: int = 5,
-    stage_maxiter: int = 60,
-) -> tuple[np.ndarray, dict, np.ndarray]:
-    """Warm up on balanced BCE, then anneal a smooth balanced-accuracy loss.
-
-    The soft objective is flat for rows far from the threshold, so optimizing it
-    from a random start would stall.  Starting from the cross-entropy solution
-    and lowering the temperature moves capacity onto the rows near the decision
-    boundary, which are the only ones whose classification can still change.
-    Every stage still reads only circuit probabilities and raw train labels.
-    """
-    weights, warm_start_summary, initial = optimize_c1_quantum_loss(
-        x,
-        y,
-        seed=seed,
-        init_scale=init_scale,
-        affine_scale_jitter=affine_scale_jitter,
-        maxiter=maxiter,
-        n_restarts=n_restarts,
-    )
-    sample_weight = balanced_sample_weights(np.asarray(y, dtype=int))
-    stages: list[dict] = []
-
-    def soft_accuracy_at(weight_values: np.ndarray, temperature: float) -> float:
-        probability = c1_exact_probabilities(x, weight_values)
-        loss, _ = soft_balanced_accuracy(
-            probability,
-            np.asarray(y, dtype=float),
-            sample_weight,
-            threshold=threshold,
-            temperature=temperature,
-        )
-        return -loss
-
-    for temperature in temperature_schedule(
-        temperature_start, temperature_stop, anneal_stages
-    ):
-        objective = partial(
-            soft_balanced_accuracy, threshold=threshold, temperature=temperature
-        )
-        before = balanced_accuracy(
-            y, (c1_exact_probabilities(x, weights) >= threshold).astype(int)
-        )
-        result = minimize(
-            lambda values: c1_value_and_gradient(x, y, values, objective),
-            weights,
-            method="L-BFGS-B",
-            jac=True,
-            bounds=_c1_bounds(),
-            options={"maxiter": stage_maxiter, "maxls": 30, "ftol": 1e-12},
-        )
-        weights = np.asarray(result.x, dtype=float)
-        stages.append(
-            {
-                "temperature": float(temperature),
-                "soft_balanced_accuracy": soft_accuracy_at(weights, temperature),
-                "train_balanced_accuracy_before": before,
-                "train_balanced_accuracy_after": balanced_accuracy(
-                    y, (c1_exact_probabilities(x, weights) >= threshold).astype(int)
-                ),
-                "iterations": int(result.nit),
-                "message": str(result.message),
-            }
-        )
-
-    return weights, {
-        "optimizer": "L-BFGS-B_with_exact_adjoint_gradient",
-        "training_emulator": "vectorized_exact_4_qubit_statevector",
-        "qiskit_equivalence_required": True,
-        "objective": "balanced_bce_warm_start_then_annealed_soft_balanced_accuracy",
-        "anneal_threshold": float(threshold),
-        "anneal_stages": stages,
-        "warm_start": warm_start_summary,
-        "history": warm_start_summary.get("history", []),
-        "best_observed_loss": warm_start_summary.get("best_observed_loss"),
-        "restart_count": warm_start_summary.get("restart_count", n_restarts),
     }, initial
 
 
@@ -255,28 +178,25 @@ def _metrics(
     x: np.ndarray,
     y: np.ndarray,
     weights: np.ndarray,
+    n_blocks: int,
     *,
     shots: int,
     seed: int,
     threshold: float = FIXED_THRESHOLD,
 ) -> dict:
-    exact = c1_exact_probabilities(x, weights)
+    exact = f1_exact_probabilities(x, weights, n_blocks)
     rng = np.random.default_rng(seed)
     shot_probability = rng.binomial(shots, exact) / shots
-    exact_prediction = (exact >= threshold).astype(int)
-    shot_prediction = (shot_probability >= threshold).astype(int)
     return {
         "rows": int(len(y)),
         "exact_balanced_accuracy_at_threshold": balanced_accuracy(
-            y, exact_prediction
+            y, (exact >= threshold).astype(int)
         ),
         "shot_balanced_accuracy_at_threshold": balanced_accuracy(
-            y, shot_prediction
+            y, (shot_probability >= threshold).astype(int)
         ),
         "exact_binary_cross_entropy": binary_cross_entropy(y, exact),
-        "exact_balanced_binary_cross_entropy": balanced_binary_cross_entropy(
-            y, exact
-        ),
+        "exact_balanced_binary_cross_entropy": balanced_binary_cross_entropy(y, exact),
         "shot_binary_cross_entropy": binary_cross_entropy(y, shot_probability),
         "mean_exact_probability": float(np.mean(exact)),
         "shots": shots,
@@ -285,12 +205,12 @@ def _metrics(
     }
 
 
-def c1_qiskit_equivalence_report(
-    x: np.ndarray, weights: np.ndarray, *, max_rows: int = 16
+def f1_qiskit_equivalence_report(
+    x: np.ndarray, weights: np.ndarray, n_blocks: int, *, max_rows: int = 16
 ) -> dict:
     sample = np.asarray(x[:max_rows], dtype=float)
-    custom = c1_exact_probabilities(sample, weights)
-    circuit, features, parameters = build_c1_unitary()
+    custom = f1_exact_probabilities(sample, weights, n_blocks)
+    circuit, features, parameters = build_f1_unitary(n_blocks)
     qiskit_probability: list[float] = []
     for row in sample:
         bindings = {
@@ -307,18 +227,21 @@ def c1_qiskit_equivalence_report(
     }
 
 
-def c1_feature_causal_report(
-    x: np.ndarray, weights: np.ndarray, *, perturbation: float = 1e-5
+def f1_feature_causal_report(
+    x: np.ndarray, weights: np.ndarray, n_blocks: int, *, perturbation: float = 1e-5
 ) -> dict:
     sample = np.asarray(x[: min(128, len(x))], dtype=float)
     rows: list[dict] = []
-    for feature_index in range(C1_N_FEATURES):
+    for feature_index in range(F1_N_FEATURES):
         plus = sample.copy()
         minus = sample.copy()
         plus[:, feature_index] += perturbation
         minus[:, feature_index] -= perturbation
         sensitivity = np.abs(
-            (c1_exact_probabilities(plus, weights) - c1_exact_probabilities(minus, weights))
+            (
+                f1_exact_probabilities(plus, weights, n_blocks)
+                - f1_exact_probabilities(minus, weights, n_blocks)
+            )
             / (2.0 * perturbation)
         )
         rows.append(
@@ -337,7 +260,7 @@ def c1_feature_causal_report(
     }
 
 
-def _config_payload(config: C1TrainConfig) -> dict:
+def _config_payload(config) -> dict:
     return {
         **asdict(config),
         "train_csv": str(config.train_csv),
@@ -345,32 +268,33 @@ def _config_payload(config: C1TrainConfig) -> dict:
     }
 
 
-def run_c1_screen(config: C1TrainConfig) -> Path:
+def run_f1_screen(config: F1TrainConfig) -> Path:
     x, y, data_info = load_raw_train(config.train_csv)
     split_seed = config.seed if config.split_seed is None else config.split_seed
     selected_rows = _stratified_subsample(y, config.max_rows, split_seed)
     screen_x, screen_y = x[selected_rows], y[selected_rows]
-    fit, valid = stratified_holdout(
-        screen_y, config.validation_fraction, split_seed
-    )
-    weights, optimization, initial = optimize_c1_quantum_loss(
+    fit, valid = stratified_holdout(screen_y, config.validation_fraction, split_seed)
+    weights, optimization, initial = optimize_f1_quantum_loss(
         screen_x[fit],
         screen_y[fit],
         seed=config.seed,
+        n_blocks=config.n_blocks,
         init_scale=config.init_scale,
+        affine_scale_center=config.affine_scale_center,
         affine_scale_jitter=config.affine_scale_jitter,
         maxiter=config.maxiter,
         n_restarts=config.n_restarts,
     )
     run_dir = config.artifacts_dir / (
-        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_screen_c1_"
-        f"split{split_seed}_init{config.seed}"
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_screen_f1_"
+        f"b{config.n_blocks}_split{split_seed}_init{config.seed}"
     )
     run_dir.mkdir(parents=True, exist_ok=False)
     payload = {
-        "mode": "train_only_holdout_C1_direct_quantum_gradient_screen",
-        "architecture": C1_ARCHITECTURE,
+        "mode": "train_only_holdout_F1_direct_quantum_gradient_screen",
+        "architecture": F1_ARCHITECTURE,
         "submission_created": False,
+        "n_blocks": config.n_blocks,
         "split_seed": split_seed,
         "init_seed": config.seed,
         "config": _config_payload(config),
@@ -382,16 +306,32 @@ def run_c1_screen(config: C1TrainConfig) -> Path:
         "classical_predictive_model_used": False,
         "optimization": optimization,
         "fit_metrics": _metrics(
-            screen_x[fit], screen_y[fit], weights, shots=config.shots, seed=split_seed + 1,
+            screen_x[fit],
+            screen_y[fit],
+            weights,
+            config.n_blocks,
+            shots=config.shots,
+            seed=split_seed + 1,
             threshold=config.decision_threshold,
         ),
         "validation_metrics": _metrics(
-            screen_x[valid], screen_y[valid], weights, shots=config.shots, seed=split_seed + 2,
+            screen_x[valid],
+            screen_y[valid],
+            weights,
+            config.n_blocks,
+            shots=config.shots,
+            seed=split_seed + 2,
             threshold=config.decision_threshold,
         ),
-        "qiskit_equivalence": c1_qiskit_equivalence_report(screen_x[valid], weights),
-        "initial_feature_causal_report": c1_feature_causal_report(screen_x, initial),
-        "trained_feature_causal_report": c1_feature_causal_report(screen_x, weights),
+        "qiskit_equivalence": f1_qiskit_equivalence_report(
+            screen_x[valid], weights, config.n_blocks
+        ),
+        "initial_feature_causal_report": f1_feature_causal_report(
+            screen_x, initial, config.n_blocks
+        ),
+        "trained_feature_causal_report": f1_feature_causal_report(
+            screen_x, weights, config.n_blocks
+        ),
         "selected_weights": [float(value) for value in weights],
     }
     (run_dir / "screen_metrics.json").write_text(
@@ -404,7 +344,7 @@ def _stratified_folds(
     y: np.ndarray, folds: int, seed: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     if folds < 2:
-        raise ValueError("C1 cross-validation requires at least two folds.")
+        raise ValueError("F1 cross-validation requires at least two folds.")
     rng = np.random.default_rng(seed)
     validation_parts: list[list[np.ndarray]] = [[] for _ in range(folds)]
     for label in (0, 1):
@@ -421,8 +361,8 @@ def _stratified_folds(
     return result
 
 
-def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
-    """Generate genuine C1 OOF probabilities and a train-only threshold."""
+def run_f1_cross_validation(config: F1CrossValidationConfig) -> Path:
+    """Generate genuine F1 OOF probabilities and a train-only threshold."""
     x, y, data_info = load_raw_train(config.train_csv)
     splits = _stratified_folds(y, config.folds, config.split_seed)
     oof_probability = np.full(len(y), np.nan, dtype=float)
@@ -430,16 +370,18 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     equivalence_reports: list[dict] = []
 
     for fold_index, (fit, valid) in enumerate(splits):
-        weights, optimization, _ = optimize_c1_quantum_loss(
+        weights, optimization, _ = optimize_f1_quantum_loss(
             x[fit],
             y[fit],
             seed=config.init_seed,
+            n_blocks=config.n_blocks,
             init_scale=config.init_scale,
+            affine_scale_center=config.affine_scale_center,
             affine_scale_jitter=config.affine_scale_jitter,
             maxiter=config.maxiter,
             n_restarts=config.n_restarts,
         )
-        probability = c1_exact_probabilities(x[valid], weights)
+        probability = f1_exact_probabilities(x[valid], weights, config.n_blocks)
         oof_probability[valid] = probability
         fold_results.append(
             {
@@ -455,10 +397,12 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
                 "optimization": optimization,
             }
         )
-        equivalence_reports.append(c1_qiskit_equivalence_report(x[valid], weights))
+        equivalence_reports.append(
+            f1_qiskit_equivalence_report(x[valid], weights, config.n_blocks)
+        )
 
     if not np.isfinite(oof_probability).all():
-        raise RuntimeError("C1 OOF generation left one or more rows unpredicted.")
+        raise RuntimeError("F1 OOF generation left one or more rows unpredicted.")
     threshold_grid = np.linspace(0.25, 0.75, 201)
     threshold_scores = np.asarray(
         [balanced_accuracy(y, oof_probability >= threshold) for threshold in threshold_grid]
@@ -469,23 +413,20 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     shot_probability = rng.binomial(config.shots, oof_probability) / config.shots
 
     run_dir = config.artifacts_dir / (
-        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_cv_c1_"
-        f"split{config.split_seed}_init{config.init_seed}"
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_cv_f1_"
+        f"b{config.n_blocks}_split{config.split_seed}_init{config.init_seed}"
     )
     run_dir.mkdir(parents=True, exist_ok=False)
     payload = {
-        "mode": "C1_quantum_only_out_of_fold_threshold_selection",
-        "architecture": C1_ARCHITECTURE,
+        "mode": "F1_quantum_only_out_of_fold_threshold_selection",
+        "architecture": F1_ARCHITECTURE,
         "submission_created": False,
-        "config": {
-            **asdict(config),
-            "train_csv": str(config.train_csv),
-            "artifacts_dir": str(config.artifacts_dir),
-        },
+        "n_blocks": config.n_blocks,
+        "config": _config_payload(config),
         "data": data_info,
         "classical_predictive_model_used": False,
         "parameter_transfer_used": False,
-        "threshold_source": "out_of_fold_C1_quantum_probabilities_only",
+        "threshold_source": "out_of_fold_F1_quantum_probabilities_only",
         "balanced_accuracy_at_0_5": balanced_accuracy(y, oof_probability >= 0.5),
         "selected_threshold": selected_threshold,
         "balanced_accuracy_at_selected_threshold": float(threshold_scores[best_index]),
@@ -509,26 +450,31 @@ def run_c1_cross_validation(config: C1CrossValidationConfig) -> Path:
     return run_dir
 
 
-def run_c1_final(config: C1TrainConfig) -> Path:
+def run_f1_final(config: F1TrainConfig) -> Path:
     x, y, data_info = load_raw_train(config.train_csv)
     if config.max_rows is not None and config.max_rows < len(y):
-        raise ValueError("C1 final training must use the complete public train set.")
+        raise ValueError("F1 final training must use the complete public train set.")
     if not 0.0 < config.decision_threshold < 1.0:
-        raise ValueError("C1 decision_threshold must be in (0, 1).")
-    weights, optimization, initial = optimize_c1_quantum_loss(
+        raise ValueError("F1 decision_threshold must be in (0, 1).")
+    weights, optimization, initial = optimize_f1_quantum_loss(
         x,
         y,
         seed=config.seed,
+        n_blocks=config.n_blocks,
         init_scale=config.init_scale,
+        affine_scale_center=config.affine_scale_center,
         affine_scale_jitter=config.affine_scale_jitter,
         maxiter=config.maxiter,
         n_restarts=config.n_restarts,
     )
     run_dir = config.artifacts_dir / (
-        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_final_c1_seed{config.seed}"
+        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_final_f1_"
+        f"b{config.n_blocks}_seed{config.seed}"
     )
     run_dir.mkdir(parents=True, exist_ok=False)
-    constraint = export_c1_submission_qasm(run_dir / "classifier.qasm")
+    constraint = export_f1_submission_qasm(
+        run_dir / "classifier.qasm", config.n_blocks
+    )
     weights_payload = {
         **{f"theta_{index}": float(value) for index, value in enumerate(weights)},
         "threshold": config.decision_threshold,
@@ -536,28 +482,30 @@ def run_c1_final(config: C1TrainConfig) -> Path:
     (run_dir / "weights.json").write_text(
         json.dumps(weights_payload, indent=2), encoding="utf-8"
     )
+    blocks = f1_reupload_blocks(config.n_blocks)
     expected_feature_uses = {
-        f"x_{feature_index}": sum(
-            feature_index in block for block in C1_REUPLOAD_BLOCKS
-        )
-        for feature_index in range(C1_N_FEATURES)
+        f"x_{feature_index}": sum(block.count(feature_index) for block in blocks)
+        for feature_index in range(F1_N_FEATURES)
     }
     provenance = {
-        "architecture": C1_ARCHITECTURE,
-        "weight_count": C1_N_WEIGHTS,
-        "parameter_generation": "label_independent_random_initialization_then_direct_C1_quantum_probability_gradient_optimization",
+        "architecture": F1_ARCHITECTURE,
+        "weight_count": f1_weight_count(config.n_blocks),
+        "parameter_generation": "label_independent_random_initialization_then_direct_F1_quantum_probability_gradient_optimization",
         "initialization": {
             "seed": config.seed,
-            "affine_scales": f"uniform({1-config.affine_scale_jitter},{1+config.affine_scale_jitter})",
+            "affine_scales": (
+                f"uniform({config.affine_scale_center - config.affine_scale_jitter},"
+                f"{config.affine_scale_center + config.affine_scale_jitter})"
+            ),
             "bias_and_mixer_parameters": f"uniform({-config.init_scale},{config.init_scale})",
             "label_dependent": False,
         },
-        "training_quantum_emulator": "vectorized exact 4-qubit statevector verified against qiskit.quantum_info.Statevector",
-        "loss_source": "C1 q0 measurement probability versus raw public_train label",
+        "training_quantum_emulator": "vectorized exact 8-qubit statevector verified against qiskit.quantum_info.Statevector",
+        "loss_source": "F1 q0 measurement probability versus raw public_train label",
         "loss": "balanced binary cross-entropy",
         "optimizer": "L-BFGS-B with exact adjoint quantum-circuit gradient",
-        "selected_raw_features_zero_based": list(range(C1_N_FEATURES)),
-        "selected_raw_features_csv": [f"x{index + 1}" for index in range(C1_N_FEATURES)],
+        "selected_raw_features_zero_based": list(range(F1_N_FEATURES)),
+        "selected_raw_features_csv": [f"x{index + 1}" for index in range(F1_N_FEATURES)],
         "expected_feature_uses": expected_feature_uses,
         "feature_processing": "none",
         "single_feature_affine_encoding": True,
@@ -575,30 +523,42 @@ def run_c1_final(config: C1TrainConfig) -> Path:
         json.dumps(provenance, indent=2), encoding="utf-8"
     )
     metrics = {
-        "mode": "full_train_C1_direct_quantum_gradient_optimization",
-        "architecture": C1_ARCHITECTURE,
+        "mode": "full_train_F1_direct_quantum_gradient_optimization",
+        "architecture": F1_ARCHITECTURE,
+        "n_blocks": config.n_blocks,
         "config": _config_payload(config),
         "data": data_info,
         "optimization": optimization,
         "full_train_metrics": _metrics(
-            x, y, weights, shots=config.shots, seed=config.seed + 1,
+            x,
+            y,
+            weights,
+            config.n_blocks,
+            shots=config.shots,
+            seed=config.seed + 1,
             threshold=config.decision_threshold,
         ),
         "constraint_report": constraint,
-        "qiskit_equivalence": c1_qiskit_equivalence_report(x, weights),
-        "initial_feature_causal_report": c1_feature_causal_report(x, initial),
-        "trained_feature_causal_report": c1_feature_causal_report(x, weights),
+        "qiskit_equivalence": f1_qiskit_equivalence_report(x, weights, config.n_blocks),
+        "initial_feature_causal_report": f1_feature_causal_report(
+            x, initial, config.n_blocks
+        ),
+        "trained_feature_causal_report": f1_feature_causal_report(
+            x, weights, config.n_blocks
+        ),
     }
     (run_dir / "training_metrics.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
     note = (
-        "C1 causal data-reuploading VQC uses all raw CSV features with no preprocessing or augmentation. "
-        "Blocks 1/3 encode x1-x4 and blocks 2/4 encode x5-x8 as single-feature affine "
-        "RY(theta_scale*x_i + theta_bias) gates. Each block then applies trainable RZ/RY mixers "
-        "and the causal CX funnel CX(3->2), CX(2->1), CX(1->0); only q0 is measured. "
+        f"F1 eight-qubit tree-funnel data-reuploading VQC uses all raw CSV features with no "
+        f"preprocessing or augmentation. Each of the {config.n_blocks} blocks encodes every raw "
+        f"feature once as a single-feature affine RY(theta_scale*x_i + theta_bias) gate, with block b "
+        f"placing feature (q + b) mod 8 on qubit q. Each block then applies trainable RZ/RY mixers "
+        f"and the CX tree funnel CX(1->0), CX(3->2), CX(5->4), CX(7->6), CX(2->0), CX(6->4), CX(4->0), "
+        f"which brings all eight qubits into the q0 causal cone within a single block; only q0 is measured. "
         "All theta values use label-independent random initialization and are optimized only against "
-        "balanced cross-entropy of the exact C1 q0 statevector probability on public_train.csv. "
+        "balanced cross-entropy of the exact F1 q0 statevector probability on public_train.csv. "
         "The vectorized adjoint statevector and Qiskit Statevector probabilities agree within 1e-10. "
         "No classical predictive, surrogate, teacher, warm-start, transferred coefficient, PCA, scaling, "
         "imputation, feature product, kernel, or augmentation is used. "

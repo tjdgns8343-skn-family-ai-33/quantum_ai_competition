@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 
+from .objectives import balanced_bce
 from .c1_circuit import (
     C1_CAUSAL_FUNNEL,
     C1_N_FEATURES,
@@ -227,23 +229,32 @@ def _balanced_sample_weights(y: np.ndarray) -> np.ndarray:
     return result
 
 
-def c1_balanced_bce_value_and_gradient(
-    x: np.ndarray, y: np.ndarray, weights: np.ndarray, *, epsilon: float = 1e-9
+def c1_value_and_gradient(
+    x: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray,
+    objective: Callable[..., tuple[float, np.ndarray]] | None = None,
+    *,
+    epsilon: float = 1e-9,
 ) -> tuple[float, np.ndarray]:
-    """Return exact circuit BCE and its analytic adjoint gradient."""
+    """Return an objective of the exact q0 probability and its adjoint gradient.
+
+    ``objective`` maps ``(probability, labels, sample_weight)`` to a loss and its
+    derivative with respect to the probability; it defaults to balanced
+    cross-entropy.  Everything it sees comes from the circuit and the raw train
+    label, so swapping it cannot introduce a classical predictive model.
+    """
     labels = np.asarray(y, dtype=float)
     state, operations = _forward_with_operations(x, weights)
     expectation = np.sum(np.abs(state) ** 2 * _Z_READOUT_SIGN[None, :], axis=1).real
     probability = np.clip((1.0 - expectation) / 2.0, epsilon, 1.0 - epsilon)
     sample_weight = _balanced_sample_weights(labels.astype(int))
-    loss = -np.sum(
-        sample_weight
-        * (labels * np.log(probability) + (1.0 - labels) * np.log1p(-probability))
-    )
-
-    dloss_dprobability = sample_weight * (
-        (probability - labels) / (probability * (1.0 - probability))
-    )
+    if objective is None:
+        loss, dloss_dprobability = balanced_bce(
+            probability, labels, sample_weight, epsilon=epsilon
+        )
+    else:
+        loss, dloss_dprobability = objective(probability, labels, sample_weight)
     dloss_dexpectation = -0.5 * dloss_dprobability
     gradient = np.zeros(C1_N_WEIGHTS, dtype=float)
 
@@ -287,3 +298,10 @@ def c1_balanced_bce_value_and_gradient(
                     np.sum(weighted_angle_derivative * factor)
                 )
     return float(loss), gradient
+
+
+def c1_balanced_bce_value_and_gradient(
+    x: np.ndarray, y: np.ndarray, weights: np.ndarray, *, epsilon: float = 1e-9
+) -> tuple[float, np.ndarray]:
+    """Return exact circuit balanced BCE and its analytic adjoint gradient."""
+    return c1_value_and_gradient(x, y, weights, None, epsilon=epsilon)

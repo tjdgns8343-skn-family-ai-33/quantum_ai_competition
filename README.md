@@ -70,3 +70,31 @@ C1은 4 qubit에서 raw feature 8개를 두 번 직접 재업로드한다. 각 d
 ```
 
 `cross-validate-c1`의 threshold는 별도 고전 모델이 아니라 각 행을 보지 않은 C1 quantum circuit의 OOF 확률만으로 선택한다.
+
+## F1 eight-qubit tree-funnel VQC
+
+C1 계열은 큐비트 2~4개, depth 15~23, CX 12개만 사용해 규정 예산(8 큐비트, depth 50,
+2-qubit gate 80개)의 절반 이하만 쓴다. F1은 같은 학습 방법론을 유지한 채 이 예산을 채운다.
+
+- 8 qubit, block당 8개 raw feature를 전부 재업로드하며 각 data gate는 여전히
+  단일 피처 affine `RY(theta_scale*x_i + theta_bias)`만 사용한다.
+- block `b`는 feature `(q + b) % 8`을 qubit `q`에 배치해, 각 피처가 업로드마다
+  퍼널의 다른 위치를 거치도록 한다. 이 배치는 사전에 고정되며 label이나 데이터
+  통계를 사용하지 않는다.
+- 얽힘은 이진 트리 퍼널 `CX(1→0), CX(3→2), CX(5→4), CX(7→6)` → `CX(2→0), CX(6→4)`
+  → `CX(4→0)`이다. CX 7개와 depth 3만으로 **한 block 안에서 8개 큐비트 전부가
+  q0의 backward causal cone에 들어온다.** C1의 선형 퍼널은 같은 depth를 쓰고도
+  먼 큐비트가 q0에 닿지 못한다.
+- block 8개면 depth 50, CX 56개, trainable parameter 257개로 규정 상한에 정확히 맞는다.
+  `--blocks`로 block 수를 줄이면 depth와 파라미터가 함께 줄어든다.
+
+```powershell
+.venv\Scripts\python.exe -m qchallenge.cli screen-f1 --data-dir raw --max-rows 1200 --blocks 8 --maxiter 400
+.venv\Scripts\python.exe -m qchallenge.cli cross-validate-f1 --data-dir raw --folds 5 --blocks 8 --maxiter 400
+.venv\Scripts\python.exe -m qchallenge.cli train-final-f1 --data-dir raw --blocks 8 --maxiter 400
+```
+
+학습기는 8큐비트 정확 statevector와 adjoint gradient를 쓰며 Qiskit `Statevector`와
+`1e-10` 이내 동치성을 검사한다. 상태가 C1의 16배라 게이트마다 이전 상태를 저장하지 않고
+역방향으로 상태를 재구성하며, 행을 64개씩 나눠 처리해 statevector가 캐시에 상주하도록 한다.
+두 최적화는 loss와 gradient 값을 바꾸지 않는다.
