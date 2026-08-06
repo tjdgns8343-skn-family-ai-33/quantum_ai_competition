@@ -574,6 +574,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Quantum-only OOF for a named candidate architecture",
     )
     candidate.add_argument("--candidate", required=True, choices=sorted(CANDIDATES))
+    candidate.add_argument(
+        "--screen",
+        action="store_true",
+        help="Single holdout instead of five folds; a first-stage filter.",
+    )
+    candidate.add_argument("--validation-fraction", type=float, default=0.2)
     candidate.add_argument("--data-dir", default="raw")
     candidate.add_argument("--artifacts-dir", default="artifacts")
     candidate.add_argument("--seed", type=int, default=2026)
@@ -805,8 +811,9 @@ def main(argv: list[str] | None = None) -> None:
         print(runner(spec, config))
         return
     if args.command == "cross-validate-candidate":
+        runner = run_spec_screen if args.screen else run_spec_cross_validation
         print(
-            run_spec_cross_validation(
+            runner(
                 build_candidate(args.candidate),
                 SpecTrainConfig(
                     train_csv=Path(args.data_dir) / "public_train.csv",
@@ -827,6 +834,7 @@ def main(argv: list[str] | None = None) -> None:
                     temperature_stop=args.temperature_stop,
                     anneal_stages=args.anneal_stages,
                     stage_maxiter=args.stage_maxiter,
+                    validation_fraction=args.validation_fraction,
                 ),
             )
         )

@@ -335,16 +335,47 @@ def _payload_config(config: SpecTrainConfig) -> dict:
     }
 
 
+def roc_auc(y: np.ndarray, probability: np.ndarray) -> float:
+    """Rank-based ROC AUC.
+
+    Reported alongside balanced accuracy because it discriminates between
+    candidates far better: it uses every positive/negative pair and carries no
+    threshold-selection noise.  On the first candidate comparison the balanced
+    accuracies differed by 0.0046 while the AUCs differed by 0.0175.
+    """
+    labels = np.asarray(y, dtype=int)
+    order = np.argsort(np.asarray(probability, dtype=float), kind="stable")
+    ranks = np.empty(len(labels), dtype=float)
+    ranks[order] = np.arange(1, len(labels) + 1, dtype=float)
+    # Average ranks within ties so equal probabilities cannot bias the score.
+    values = np.asarray(probability, dtype=float)[order]
+    start = 0
+    for stop in range(1, len(values) + 1):
+        if stop == len(values) or values[stop] != values[start]:
+            ranks[order[start:stop]] = (start + stop + 1) / 2.0
+            start = stop
+    positive = int(np.count_nonzero(labels == 1))
+    negative = len(labels) - positive
+    if positive == 0 or negative == 0:
+        raise ValueError("ROC AUC needs both classes.")
+    return float(
+        (ranks[labels == 1].sum() - positive * (positive + 1) / 2.0)
+        / (positive * negative)
+    )
+
+
 def run_spec_screen(spec: CircuitSpec, config: SpecTrainConfig) -> Path:
+    """Single train-only holdout; one fifth the cost of the five-fold run.
+
+    Used as a first-stage filter. Anything that screens clearly better than the
+    incumbent earns a full cross-validation before it is believed.
+    """
     x, y, data_info = load_raw_train(config.train_csv)
     split_seed = config.seed if config.split_seed is None else config.split_seed
     selected = _subsample(y, config.max_rows, split_seed)
     screen_x, screen_y = x[selected], y[selected]
     fit, valid = stratified_holdout(screen_y, config.validation_fraction, split_seed)
-    weights, optimization, initial = optimize_spec(
-        spec,
-        screen_x[fit],
-        screen_y[fit],
+    shared = dict(
         seed=config.seed,
         init_scale=config.init_scale,
         affine_scale_center=config.affine_scale_center,
@@ -352,6 +383,41 @@ def run_spec_screen(spec: CircuitSpec, config: SpecTrainConfig) -> Path:
         maxiter=config.maxiter,
         n_restarts=config.n_restarts,
     )
+    if config.objective == "balanced_bce":
+        weights, optimization, initial = optimize_spec(
+            spec, screen_x[fit], screen_y[fit], **shared
+        )
+    else:
+        weights, optimization, initial = optimize_spec_annealed(
+            spec,
+            screen_x[fit],
+            screen_y[fit],
+            surrogate=config.objective,
+            threshold=config.decision_threshold,
+            temperature_start=config.temperature_start,
+            temperature_stop=config.temperature_stop,
+            anneal_stages=config.anneal_stages,
+            stage_maxiter=config.stage_maxiter,
+            **shared,
+        )
+    stage_curve: list[dict] = []
+    grid = np.linspace(0.25, 0.75, 201)
+    for position, values in enumerate(optimization.pop("stage_weights", [])):
+        probability = exact_probabilities(
+            spec, screen_x[valid], np.asarray(values, dtype=float)
+        )
+        scores = [balanced_accuracy(screen_y[valid], probability >= t) for t in grid]
+        best = int(np.argmax(scores))
+        stage_curve.append(
+            {
+                "stage": position,
+                "temperature": optimization["stage_temperatures"][position],
+                "is_warm_start_only": position == 0,
+                "validation_balanced_accuracy": float(scores[best]),
+                "validation_selected_threshold": float(grid[best]),
+                "validation_roc_auc": roc_auc(screen_y[valid], probability),
+            }
+        )
     run_dir = config.artifacts_dir / (
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_screen_{config.label}_"
         f"split{split_seed}_init{config.seed}"
@@ -387,6 +453,10 @@ def run_spec_screen(spec: CircuitSpec, config: SpecTrainConfig) -> Path:
             spec, screen_x[valid], screen_y[valid], weights,
             shots=config.shots, seed=split_seed + 2,
             threshold=config.decision_threshold,
+        ),
+        "annealing_stage_curve": stage_curve,
+        "validation_roc_auc": roc_auc(
+            screen_y[valid], exact_probabilities(spec, screen_x[valid], weights)
         ),
         "qiskit_equivalence": qiskit_equivalence_report(spec, screen_x[valid], weights),
         "trained_feature_causal_report": feature_causal_report(spec, screen_x, weights),

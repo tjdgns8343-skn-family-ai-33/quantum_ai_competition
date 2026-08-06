@@ -92,6 +92,72 @@ def build_spec(
     )
 
 
+def build_spec_per_block(
+    name: str,
+    blocks: Sequence[Sequence[Sequence[int]]],
+    *,
+    entangler: Sequence[tuple[str, int, int]] = CX_TREE,
+) -> CircuitSpec:
+    """Like ``build_spec`` but each block has its own feature assignment."""
+    gates: list[Gate] = []
+    cursor = 0
+    n_qubits = len(blocks[0])
+    for qubit_features in blocks:
+        for qubit, features in enumerate(qubit_features):
+            for position, feature in enumerate(features):
+                gates.append(
+                    Gate(
+                        kind=ALTERNATING_AXES[position % 2],
+                        qubit=qubit,
+                        feature=feature,
+                        scale_index=cursor,
+                        bias_index=cursor + 1,
+                    )
+                )
+                cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(n_qubits):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        for entangling_kind, control, target in entangler:
+            gates.append(Gate(kind=entangling_kind, control=control, target=target))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=name,
+        n_qubits=n_qubits,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+# The submitted circuit, expressed as a spec so it can be screened on exactly
+# the same instrument as every challenger.  Blocks alternate x1-x4 and x5-x8
+# across q0-q3, one feature per qubit per block, with the linear causal funnel.
+C1_FUNNEL = (("cx", 3, 2), ("cx", 2, 1), ("cx", 1, 0))
+C1_BLOCKS = (
+    ((0,), (1,), (2,), (3,)),
+    ((4,), (5,), (6,), (7,)),
+    ((0,), (1,), (2,), (3,)),
+    ((4,), (5,), (6,), (7,)),
+)
+
+
+C1_FUNNEL_CZ = (("cz", 3, 2), ("cz", 2, 1), ("cz", 1, 0))
+# Mixed: CZ builds phase correlations, the trailing CX still moves population
+# toward the readout. CZ is diagonal, so on its own it cannot change any
+# computational-basis amplitude magnitude -- its effect on the measured q0
+# probability appears only through rotations that follow it.
+C1_FUNNEL_MIXED = (("cz", 3, 2), ("cz", 2, 1), ("cx", 1, 0))
+
+
+def c1_reference(entangler=C1_FUNNEL, suffix: str = "") -> CircuitSpec:
+    return build_spec_per_block(
+        f"reference_c1_causal_reupload{suffix}", C1_BLOCKS, entangler=entangler
+    )
+
+
 def all_to_all(n_blocks: int, *, entangler=CX_TREE) -> CircuitSpec:
     """Every qubit sees every raw feature."""
     return build_spec(
@@ -123,10 +189,18 @@ def pair_focused(n_blocks: int, *, entangler=CX_TREE) -> CircuitSpec:
 
 
 CANDIDATES: dict[str, Callable[[], CircuitSpec]] = {
+    "c1ref": c1_reference,
+    # Z1: the winning encoding with the diagonal entangler.
+    "c1ref_cz": lambda: c1_reference(C1_FUNNEL_CZ, "_cz"),
+    "c1ref_cxcz": lambda: c1_reference(C1_FUNNEL_MIXED, "_cxcz"),
     "a1b2": lambda: all_to_all(2),
     "a1b3": lambda: all_to_all(3),
-    "l1b5": lambda: latent_focused(5),
-    "l1b6": lambda: latent_focused(6),
+    # Upload sweep for the three directions: 4 qubits x n blocks uploads each.
+    "l1b2": lambda: latent_focused(2),   # 8 uploads per direction
+    "l1b3": lambda: latent_focused(3),   # 12
+    "l1b5": lambda: latent_focused(5),   # 20
+    "l1b6": lambda: latent_focused(6),  # 24
+    "p1b4": lambda: pair_focused(4),
     "p1b6": lambda: pair_focused(6),
     # Z1: the winning encoding re-run with the diagonal entangler.
     "a1b2_cz": lambda: all_to_all(2, entangler=CZ_TREE),
