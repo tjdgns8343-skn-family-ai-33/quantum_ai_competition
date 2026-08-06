@@ -458,3 +458,39 @@ stage 4부터 9까지 여섯 구간이 모두 0.8126 이상이다. soft balanced
 다만 T는 여전히 OOF에서 선택했고 split seed 하나의 결과이므로, 독립 split seed
 2027과 2028에서 재현을 확인한 뒤에만 제출 후보로 삼는다. 재현 확인을 위해 각 온도
 단계의 fold별 balanced accuracy를 artifact에 함께 기록한다.
+
+### 15.3 독립 split 재현
+
+| split seed | 워밍업(BCE) | 최적 OOF BA | 선택 stage | T | 이득 |
+|---:|---:|---:|---:|---:|---:|
+| 2026 | 0.8050 | 0.8160 | 6 | 0.0568 | +0.0110 |
+| 2027 | 0.8055 | 0.8149 | 6 | 0.0568 | +0.0095 |
+| 2028 | 0.7991 | 0.8115 | 6 | 0.0568 | +0.0124 |
+
+세 split이 각각 독립적으로 동일한 stage 6을 선택했고 이득의 표준편차는 0.0015다.
+곡선 모양도 세 번 모두 같다. 최적 온도가 split에 따라 이동하지 않으므로 stage 6 고정은
+데이터에 맞춘 선택이 아니며, 15.2에서 남겨둔 선택 편향 우려는 해소된다.
+
+fold 단위로도 split 2027이 5개 중 4개, split 2028이 5개 중 5개 fold에서 개선됐다.
+threshold는 0.4650, 0.4625, 0.4750으로 좁게 모인다.
+
+### 15.4 제출 후보
+
+전체 6,000행에서 동일한 어닐링 스케줄을 재생하고 stage 6의 가중치를 사용했다.
+threshold는 세 train-only OOF의 평균인 0.4675로 고정했다.
+
+| 측정 | 값 |
+|---|---:|
+| 3-split OOF 평균 (train-only, 선택 근거) | 0.8141 |
+| public_test.csv 6,000행 (보고 전용, 선택 미사용) | 0.8134 |
+| public_test 1,024-shot | 0.8173 |
+| full-train 적합 | 0.8177 |
+
+train-only OOF가 예측한 0.8141과 어떤 선택에도 사용하지 않은 public_test의 0.8134가
+0.0007 차이로 일치한다. 13.2절에서 확인한 "OOF가 leaderboard를 예측한다"는 성질이
+새 목적함수에서도 유지된다.
+
+artifact audit는 회로 제약(4 qubit, depth 23, CX 12, 측정 1회), 단일 피처 affine
+encoding, 피처별 사용 횟수, q0 단독 측정, weights 이름, threshold provenance, 고전
+사전학습 부재를 모두 통과했다. Qiskit `Statevector` 대비 확률 오차는 `4.4e-16`이다.
+패키지는 `submit/c1_auc_stage6`이다.
