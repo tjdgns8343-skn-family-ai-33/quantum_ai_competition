@@ -137,6 +137,12 @@ def _c1_config(args: argparse.Namespace, *, validation: bool) -> C1TrainConfig:
         max_rows=getattr(args, "max_rows", None) if validation else None,
         decision_threshold=args.threshold,
         n_restarts=getattr(args, "restarts", 1),
+        objective=getattr(args, "objective", "balanced_bce"),
+        temperature_start=getattr(args, "temperature_start", 0.30),
+        temperature_stop=getattr(args, "temperature_stop", 0.015),
+        anneal_stages=getattr(args, "anneal_stages", 10),
+        stage_maxiter=getattr(args, "stage_maxiter", 40),
+        select_stage=getattr(args, "select_stage", None),
     )
 
 
@@ -324,6 +330,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Train C1 directly on the complete public train set",
     )
     _add_c1_training_args(c1_final, validation=False)
+    c1_final.add_argument(
+        "--objective",
+        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc"),
+        default="balanced_bce",
+    )
+    c1_final.add_argument("--temperature-start", type=float, default=0.30)
+    c1_final.add_argument("--temperature-stop", type=float, default=0.015)
+    c1_final.add_argument("--anneal-stages", type=int, default=10)
+    c1_final.add_argument("--stage-maxiter", type=int, default=40)
+    c1_final.add_argument(
+        "--select-stage",
+        type=int,
+        default=None,
+        help="Annealing stage to submit, chosen from the train-only OOF curve.",
+    )
     c1_cv = sub.add_parser(
         "cross-validate-c1",
         help="Generate C1 quantum-only OOF probabilities and threshold",

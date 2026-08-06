@@ -33,6 +33,7 @@ from .c1_simulator import (
     c1_value_and_gradient,
 )
 from .data import load_raw_train
+from .encoding_note import build_encoding_note
 from .metrics import (
     balanced_accuracy,
     balanced_binary_cross_entropy,
@@ -55,6 +56,16 @@ class C1TrainConfig:
     validation_fraction: float = 0.2
     max_rows: int | None = None
     decision_threshold: float = FIXED_THRESHOLD
+    objective: str = "balanced_bce"
+    temperature_start: float = 0.30
+    temperature_stop: float = 0.015
+    anneal_stages: int = 10
+    stage_maxiter: int = 40
+    # Which annealing stage to submit.  Annealing is a path, not a point: the
+    # cross-validation selected "stage k of this schedule", so the final run
+    # replays the same schedule and takes the weights from that stage rather
+    # than re-annealing straight to the chosen temperature.
+    select_stage: int | None = None
 
 
 @dataclass(frozen=True)
@@ -613,15 +624,50 @@ def run_c1_final(config: C1TrainConfig) -> Path:
         raise ValueError("C1 final training must use the complete public train set.")
     if not 0.0 < config.decision_threshold < 1.0:
         raise ValueError("C1 decision_threshold must be in (0, 1).")
-    weights, optimization, initial = optimize_c1_quantum_loss(
-        x,
-        y,
+    shared = dict(
         seed=config.seed,
         init_scale=config.init_scale,
         affine_scale_jitter=config.affine_scale_jitter,
         maxiter=config.maxiter,
         n_restarts=config.n_restarts,
     )
+    if config.objective == "balanced_bce":
+        weights, optimization, initial = optimize_c1_quantum_loss(x, y, **shared)
+    elif config.objective in ("soft_balanced_accuracy", "smooth_auc"):
+        weights, optimization, initial = optimize_c1_annealed(
+            x,
+            y,
+            surrogate=config.objective,
+            temperature_start=config.temperature_start,
+            temperature_stop=config.temperature_stop,
+            anneal_stages=config.anneal_stages,
+            stage_maxiter=config.stage_maxiter,
+            **shared,
+        )
+        if config.select_stage is not None:
+            stage_weights = optimization["stage_weights"]
+            if not 0 <= config.select_stage < len(stage_weights):
+                raise ValueError(
+                    f"select_stage must be in 0..{len(stage_weights) - 1}."
+                )
+            weights = np.asarray(
+                stage_weights[config.select_stage], dtype=float
+            )
+            optimization = {
+                **optimization,
+                "submitted_stage": config.select_stage,
+                "submitted_temperature": optimization["stage_temperatures"][
+                    config.select_stage
+                ],
+                "stage_selection": "index_chosen_from_train_only_out_of_fold_curve",
+            }
+        optimization = {
+            key: value
+            for key, value in optimization.items()
+            if key != "stage_weights"
+        }
+    else:
+        raise ValueError(f"Unknown C1 objective: {config.objective!r}")
     run_dir = config.artifacts_dir / (
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_final_c1_seed{config.seed}"
     )
@@ -652,7 +698,31 @@ def run_c1_final(config: C1TrainConfig) -> Path:
         },
         "training_quantum_emulator": "vectorized exact 4-qubit statevector verified against qiskit.quantum_info.Statevector",
         "loss_source": "C1 q0 measurement probability versus raw public_train label",
-        "loss": "balanced binary cross-entropy",
+        "loss": {
+            "balanced_bce": "balanced binary cross-entropy",
+            "soft_balanced_accuracy": (
+                "balanced binary cross-entropy warm start, then annealed "
+                "sigmoid((p - threshold)/T) surrogate of balanced accuracy"
+            ),
+            "smooth_auc": (
+                "balanced binary cross-entropy warm start, then annealed "
+                "sigmoid((p_pos - p_neg)/T) surrogate of ROC AUC over all "
+                "positive/negative train pairs"
+            ),
+        }[config.objective],
+        "loss_inputs": "circuit q0 probability and raw public_train label only",
+        "annealing": None
+        if config.objective == "balanced_bce"
+        else {
+            "temperature_start": config.temperature_start,
+            "temperature_stop": config.temperature_stop,
+            "stages": config.anneal_stages,
+            "submitted_stage": config.select_stage,
+            "stage_and_temperature_selection": (
+                "train-only 5-fold out-of-fold balanced accuracy on "
+                "public_train.csv; public_test.csv was not used"
+            ),
+        },
         "optimizer": "L-BFGS-B with exact adjoint quantum-circuit gradient",
         "selected_raw_features_zero_based": list(range(C1_N_FEATURES)),
         "selected_raw_features_csv": [f"x{index + 1}" for index in range(C1_N_FEATURES)],
@@ -690,17 +760,37 @@ def run_c1_final(config: C1TrainConfig) -> Path:
     (run_dir / "training_metrics.json").write_text(
         json.dumps(metrics, indent=2), encoding="utf-8"
     )
-    note = (
-        "C1 causal data-reuploading VQC uses all raw CSV features with no preprocessing or augmentation. "
-        "Blocks 1/3 encode x1-x4 and blocks 2/4 encode x5-x8 as single-feature affine "
-        "RY(theta_scale*x_i + theta_bias) gates. Each block then applies trainable RZ/RY mixers "
-        "and the causal CX funnel CX(3->2), CX(2->1), CX(1->0); only q0 is measured. "
-        "All theta values use label-independent random initialization and are optimized only against "
-        "balanced cross-entropy of the exact C1 q0 statevector probability on public_train.csv. "
-        "The vectorized adjoint statevector and Qiskit Statevector probabilities agree within 1e-10. "
-        "No classical predictive, surrogate, teacher, warm-start, transferred coefficient, PCA, scaling, "
-        "imputation, feature product, kernel, or augmentation is used. "
-        f"Threshold is {config.decision_threshold:g} and must be selected only from train-only quantum predictions."
+    note = build_encoding_note(
+        architecture=C1_ARCHITECTURE,
+        encoding_description=(
+            "Raw features enter as RY rotations. Re-uploading blocks 1 and 3 encode "
+            "x1-x4 on q0-q3 and blocks 2 and 4 encode x5-x8 on q0-q3, each as one "
+            "RY(theta_scale * x_i + theta_bias) gate carrying a single raw feature."
+        ),
+        entanglement_description=(
+            "Each block applies trainable RZ and RY mixers, then the causal CX funnel "
+            "CX(3->2), CX(2->1), CX(1->0). A final trainable RY on the readout qubit "
+            "turns accumulated phase into a Z-basis probability."
+        ),
+        readout_qubit=0,
+        used_features=range(C1_N_FEATURES),
+        uploads_per_feature=expected_feature_uses,
+        qubits=constraint["qubits"],
+        depth=constraint["depth"],
+        two_qubit_gates=constraint["two_qubit_gate_count"],
+        weight_count=C1_N_WEIGHTS,
+        objective=config.objective,
+        threshold=config.decision_threshold,
+        threshold_source=(
+            "balanced accuracy of train-only 5-fold out-of-fold circuit probabilities "
+            "on public_train.csv"
+        ),
+        initialization=(
+            f"Every theta starts from a label-independent uniform random draw with seed "
+            f"{config.seed}: affine scales near 1, biases and mixers near 0. Nothing "
+            "about the labels enters the initialization."
+        ),
+        annealing=provenance["annealing"],
     )
-    (run_dir / "encoding_note.txt").write_text(note + "\n", encoding="utf-8")
+    (run_dir / "encoding_note.txt").write_text(note, encoding="utf-8")
     return run_dir
