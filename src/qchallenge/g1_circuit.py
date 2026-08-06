@@ -48,26 +48,49 @@ G1_QUBIT_GROUPS = (G1_GROUP_A, G1_GROUP_B, G1_GROUP_A, G1_GROUP_B)
 G1_ENTANGLER = ((1, 0), (3, 2), (2, 0))
 
 
-def g1_gates_per_block() -> int:
-    return sum(len(group) for group in G1_QUBIT_GROUPS)
+G1_X1 = 0  # zero-based index of raw column x1
 
 
-def g1_weights_per_block() -> int:
+def g1_qubit_groups(include_x1: bool = False) -> tuple[tuple[int, ...], ...]:
+    """Feature sequence each qubit receives.
+
+    x1 is dropped by default: it has std 0.372 against 0.61-1.61 for the other
+    columns, only 147 distinct values in 6,000 rows, and the earlier
+    quantum-only beam search never selected it.  ``include_x1`` appends it to
+    every qubit instead, since it is a third independent direction rather than a
+    view of either group, and both groups should be able to combine with it.
+    Everything else stays identical, so the two specs differ in one factor.
+    """
+    if not include_x1:
+        return G1_QUBIT_GROUPS
+    return tuple((*group, G1_X1) for group in G1_QUBIT_GROUPS)
+
+
+def g1_gates_per_block(include_x1: bool = False) -> int:
+    return sum(len(group) for group in g1_qubit_groups(include_x1))
+
+
+def g1_weights_per_block(include_x1: bool = False) -> int:
     """Two weights per data gate, plus an RZ and an RY mixer per qubit."""
-    return 2 * g1_gates_per_block() + 2 * G1_N_QUBITS
+    return 2 * g1_gates_per_block(include_x1) + 2 * G1_N_QUBITS
 
 
-def g1_weight_count(n_blocks: int = G1_DEFAULT_BLOCKS) -> int:
+def g1_weight_count(
+    n_blocks: int = G1_DEFAULT_BLOCKS, include_x1: bool = False
+) -> int:
     if n_blocks < 1:
         raise ValueError("G1 requires at least one block.")
-    return g1_weights_per_block() * n_blocks + 1
+    return g1_weights_per_block(include_x1) * n_blocks + 1
 
 
-def build_g1_spec(n_blocks: int = G1_DEFAULT_BLOCKS) -> CircuitSpec:
+def build_g1_spec(
+    n_blocks: int = G1_DEFAULT_BLOCKS, include_x1: bool = False
+) -> CircuitSpec:
+    groups = g1_qubit_groups(include_x1)
     gates: list[Gate] = []
     cursor = 0
     for _ in range(n_blocks):
-        for qubit, group in enumerate(G1_QUBIT_GROUPS):
+        for qubit, group in enumerate(groups):
             for position, feature in enumerate(group):
                 gates.append(
                     Gate(
@@ -92,35 +115,38 @@ def build_g1_spec(n_blocks: int = G1_DEFAULT_BLOCKS) -> CircuitSpec:
     cursor += 1
 
     spec = CircuitSpec(
-        name="compliant_g1_latent_group_reupload",
+        name="compliant_g1_latent_group_reupload"
+        + ("_with_x1" if include_x1 else ""),
         n_qubits=G1_N_QUBITS,
         n_weights=cursor,
         readout_qubit=G1_READOUT_QUBIT,
         gates=tuple(gates),
     )
     validate(spec)
-    if spec.n_weights != g1_weight_count(n_blocks):
+    if spec.n_weights != g1_weight_count(n_blocks, include_x1):
         raise RuntimeError("G1 weight bookkeeping disagrees with the spec.")
     return spec
 
 
-def g1_constraint_report(n_blocks: int = G1_DEFAULT_BLOCKS) -> dict:
-    circuit, _, _ = build_circuit(build_g1_spec(n_blocks), measured=True)
+def g1_constraint_report(
+    n_blocks: int = G1_DEFAULT_BLOCKS, include_x1: bool = False
+) -> dict:
+    circuit, _, _ = build_circuit(build_g1_spec(n_blocks, include_x1), measured=True)
     return constraint_report(circuit)
 
 
 def export_g1_submission_qasm(
-    destination: Path, n_blocks: int = G1_DEFAULT_BLOCKS
+    destination: Path, n_blocks: int = G1_DEFAULT_BLOCKS, include_x1: bool = False
 ) -> dict:
-    spec = build_g1_spec(n_blocks)
+    spec = build_g1_spec(n_blocks, include_x1)
     circuit, _, _ = build_circuit(spec, measured=True)
     report = constraint_report(circuit)
     if not report["passes"]:
         raise ValueError(f"G1 circuit constraint failure: {report}")
+    columns = ", ".join(f"x{index + 1}" for index in spec.used_features())
     destination.write_text(
-        "// G1: raw x2..x8 enter only single-feature affine RY/RZ gates; "
-        "x1 is unused; no preprocessing or augmentation.\n"
-        + qasm3.dumps(circuit),
+        f"// G1: raw {columns} enter only single-feature affine RY/RZ gates; "
+        "no preprocessing or augmentation.\n" + qasm3.dumps(circuit),
         encoding="utf-8",
     )
     return report

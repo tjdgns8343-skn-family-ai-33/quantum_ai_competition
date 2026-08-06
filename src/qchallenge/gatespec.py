@@ -23,6 +23,7 @@ from qiskit.circuit import Parameter
 from .circuit import ALLOWED_GATES
 
 ROTATIONS = ("ry", "rz")
+ENTANGLERS = ("cx", "cz")
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ class CircuitSpec:
         )
 
     def two_qubit_count(self) -> int:
-        return sum(1 for gate in self.gates if gate.kind == "cx")
+        return sum(1 for gate in self.gates if gate.kind in ENTANGLERS)
 
 
 def validate(spec: CircuitSpec) -> None:
@@ -77,15 +78,16 @@ def validate(spec: CircuitSpec) -> None:
         raise ValueError(f"{spec.name}: readout qubit outside the register.")
     seen_weights: set[int] = set()
     for gate in spec.gates:
-        if gate.kind == "cx":
+        if gate.kind in ENTANGLERS:
+            label = gate.kind.upper()
             if gate.control is None or gate.target is None:
-                raise ValueError(f"{spec.name}: CX needs a control and a target.")
+                raise ValueError(f"{spec.name}: {label} needs a control and a target.")
             if gate.control == gate.target:
-                raise ValueError(f"{spec.name}: CX control and target must differ.")
+                raise ValueError(f"{spec.name}: {label} control and target must differ.")
             if not all(
                 0 <= q < spec.n_qubits for q in (gate.control, gate.target)
             ):
-                raise ValueError(f"{spec.name}: CX qubit outside the register.")
+                raise ValueError(f"{spec.name}: {label} qubit outside the register.")
             continue
         if gate.kind not in ROTATIONS:
             raise ValueError(f"{spec.name}: unsupported gate {gate.kind!r}.")
@@ -120,8 +122,8 @@ def build_circuit(spec: CircuitSpec, *, measured: bool = False) -> tuple[
     weights = [Parameter(f"theta_{index}") for index in range(spec.n_weights)]
     circuit = QuantumCircuit(spec.n_qubits, name=spec.name)
     for gate in spec.gates:
-        if gate.kind == "cx":
-            circuit.cx(gate.control, gate.target)
+        if gate.kind in ENTANGLERS:
+            getattr(circuit, gate.kind)(gate.control, gate.target)
             continue
         if gate.is_data:
             angle = (

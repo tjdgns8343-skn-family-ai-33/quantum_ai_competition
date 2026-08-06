@@ -18,11 +18,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+from functools import partial
 from qiskit.quantum_info import Statevector
+from scipy.optimize import minimize
 
 from .data import load_raw_train
 from .gatespec import CircuitSpec, build_circuit
 from .generic_simulator import exact_probabilities, value_and_gradient
+from .objectives import (
+    smooth_auc,
+    smooth_ks,
+    soft_balanced_accuracy,
+    temperature_schedule,
+)
 from .metrics import (
     balanced_accuracy,
     balanced_binary_cross_entropy,
@@ -49,6 +57,11 @@ class SpecTrainConfig:
     validation_fraction: float = 0.2
     max_rows: int | None = None
     decision_threshold: float = FIXED_THRESHOLD
+    objective: str = "balanced_bce"
+    temperature_start: float = 0.30
+    temperature_stop: float = 0.015
+    anneal_stages: int = 10
+    stage_maxiter: int = 40
 
 
 def scale_indices(spec: CircuitSpec) -> tuple[int, ...]:
@@ -129,6 +142,91 @@ def optimize_spec(
         "weight_count": spec.n_weights,
         "restart_seeds": seeds,
         **summary,
+    }, initial
+
+
+def optimize_spec_annealed(
+    spec: CircuitSpec,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    surrogate: str,
+    seed: int,
+    init_scale: float,
+    affine_scale_center: float,
+    affine_scale_jitter: float,
+    maxiter: int,
+    n_restarts: int,
+    threshold: float = FIXED_THRESHOLD,
+    temperature_start: float = 0.30,
+    temperature_stop: float = 0.015,
+    anneal_stages: int = 10,
+    stage_maxiter: int = 40,
+) -> tuple[np.ndarray, dict, np.ndarray]:
+    """Balanced-BCE warm start, then anneal a surrogate; same shape as C1's.
+
+    Weights are recorded at every stage so one cross-validation run yields the
+    whole temperature curve and the stop temperature is chosen out-of-fold.
+    """
+    builders = {
+        "smooth_auc": lambda t: partial(smooth_auc, temperature=t),
+        "smooth_ks": lambda t: partial(smooth_ks, temperature=t),
+        "soft_balanced_accuracy": lambda t: partial(
+            soft_balanced_accuracy, threshold=threshold, temperature=t
+        ),
+    }
+    if surrogate not in builders:
+        raise ValueError(f"Unknown surrogate: {surrogate!r}")
+
+    weights, warm_start_summary, initial = optimize_spec(
+        spec,
+        x,
+        y,
+        seed=seed,
+        init_scale=init_scale,
+        affine_scale_center=affine_scale_center,
+        affine_scale_jitter=affine_scale_jitter,
+        maxiter=maxiter,
+        n_restarts=n_restarts,
+    )
+    stage_weights = [[float(v) for v in weights]]
+    stage_temperatures: list[float | None] = [None]
+    stages: list[dict] = []
+
+    for temperature in temperature_schedule(
+        temperature_start, temperature_stop, anneal_stages
+    ):
+        objective = builders[surrogate](temperature)
+        result = minimize(
+            lambda values: value_and_gradient(spec, x, y, values, objective),
+            weights,
+            method="L-BFGS-B",
+            jac=True,
+            bounds=spec_bounds(spec),
+            options={"maxiter": stage_maxiter, "maxls": 30, "ftol": 1e-12},
+        )
+        weights = np.asarray(result.x, dtype=float)
+        stage_weights.append([float(v) for v in weights])
+        stage_temperatures.append(float(temperature))
+        stages.append(
+            {
+                "temperature": float(temperature),
+                "train_balanced_accuracy": balanced_accuracy(
+                    y, (exact_probabilities(spec, x, weights) >= threshold).astype(int)
+                ),
+                "iterations": int(result.nit),
+            }
+        )
+
+    return weights, {
+        "optimizer": "L-BFGS-B_with_exact_adjoint_gradient",
+        "objective": f"balanced_bce_warm_start_then_annealed_{surrogate}",
+        "weight_count": spec.n_weights,
+        "anneal_stages": stages,
+        "stage_weights": stage_weights,
+        "stage_temperatures": stage_temperatures,
+        "warm_start": warm_start_summary,
+        "restart_count": warm_start_summary.get("restart_count", n_restarts),
     }, initial
 
 
@@ -323,16 +421,47 @@ def run_spec_cross_validation(spec: CircuitSpec, config: SpecTrainConfig) -> Pat
     split_seed = config.seed if config.split_seed is None else config.split_seed
     oof = np.full(len(y), np.nan, dtype=float)
     fold_results = []
-    for index, (fit, valid) in enumerate(_stratified_folds(y, config.folds, split_seed)):
-        weights, optimization, _ = optimize_spec(
-            spec, x[fit], y[fit],
-            seed=config.seed,
-            init_scale=config.init_scale,
-            affine_scale_center=config.affine_scale_center,
-            affine_scale_jitter=config.affine_scale_jitter,
-            maxiter=config.maxiter,
-            n_restarts=config.n_restarts,
-        )
+    stage_oof: list[np.ndarray] | None = None
+    stage_temperatures: list[float | None] = []
+    splits = _stratified_folds(y, config.folds, split_seed)
+    shared = dict(
+        seed=config.seed,
+        init_scale=config.init_scale,
+        affine_scale_center=config.affine_scale_center,
+        affine_scale_jitter=config.affine_scale_jitter,
+        maxiter=config.maxiter,
+        n_restarts=config.n_restarts,
+    )
+    for index, (fit, valid) in enumerate(splits):
+        if config.objective == "balanced_bce":
+            weights, optimization, _ = optimize_spec(spec, x[fit], y[fit], **shared)
+        else:
+            weights, optimization, _ = optimize_spec_annealed(
+                spec,
+                x[fit],
+                y[fit],
+                surrogate=config.objective,
+                threshold=config.decision_threshold,
+                temperature_start=config.temperature_start,
+                temperature_stop=config.temperature_stop,
+                anneal_stages=config.anneal_stages,
+                stage_maxiter=config.stage_maxiter,
+                **shared,
+            )
+        if "stage_weights" in optimization:
+            if stage_oof is None:
+                stage_oof = [
+                    np.full(len(y), np.nan, dtype=float)
+                    for _ in optimization["stage_weights"]
+                ]
+                stage_temperatures = optimization["stage_temperatures"]
+            for position, values in enumerate(optimization["stage_weights"]):
+                stage_oof[position][valid] = exact_probabilities(
+                    spec, x[valid], np.asarray(values, dtype=float)
+                )
+            optimization = {
+                k: v for k, v in optimization.items() if k != "stage_weights"
+            }
         probability = exact_probabilities(spec, x[valid], weights)
         oof[valid] = probability
         fold_results.append(
@@ -355,6 +484,38 @@ def run_spec_cross_validation(spec: CircuitSpec, config: SpecTrainConfig) -> Pat
     best = int(np.argmax(scores))
     rng = np.random.default_rng(split_seed + 1000)
     shot_probability = rng.binomial(config.shots, oof) / config.shots
+
+    # Out-of-fold score at every annealing temperature, so the stop temperature
+    # is chosen on held-out rows rather than on the training fit.
+    temperature_curve: list[dict] = []
+    if stage_oof is not None:
+        for position, probabilities in enumerate(stage_oof):
+            if not np.isfinite(probabilities).all():
+                raise RuntimeError("Stage OOF generation left rows unpredicted.")
+            stage_scores = np.asarray(
+                [balanced_accuracy(y, probabilities >= t) for t in grid]
+            )
+            top = int(np.argmax(stage_scores))
+            shot = rng.binomial(config.shots, probabilities) / config.shots
+            temperature_curve.append(
+                {
+                    "stage": position,
+                    "temperature": stage_temperatures[position],
+                    "is_warm_start_only": position == 0,
+                    "per_fold_balanced_accuracy_at_selected_threshold": [
+                        balanced_accuracy(
+                            y[rows], probabilities[rows] >= grid[top]
+                        )
+                        for _, rows in splits
+                    ],
+                    "balanced_accuracy_at_0_5": balanced_accuracy(y, probabilities >= 0.5),
+                    "selected_threshold": float(grid[top]),
+                    "balanced_accuracy_at_selected_threshold": float(stage_scores[top]),
+                    "shot_balanced_accuracy_at_selected_threshold": balanced_accuracy(
+                        y, shot >= grid[top]
+                    ),
+                }
+            )
 
     run_dir = config.artifacts_dir / (
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_cv_{config.label}_"
@@ -385,6 +546,7 @@ def run_spec_cross_validation(spec: CircuitSpec, config: SpecTrainConfig) -> Pat
             y, shot_probability >= grid[best]
         ),
         "balanced_binary_cross_entropy": balanced_binary_cross_entropy(y, oof),
+        "annealing_temperature_curve": temperature_curve,
         "fold_results": fold_results,
         "oof_probability": [float(value) for value in oof],
     }

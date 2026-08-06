@@ -71,6 +71,14 @@ def _apply_cx(state, control_axis, target_axis):
     return state
 
 
+def _apply_cz(state, control_axis, target_axis):
+    """CZ flips the sign of the branch where both qubits are 1; self-inverse."""
+    branch = _half(state, control_axis, 1)
+    reduced = target_axis if target_axis < control_axis else target_axis - 1
+    _half(branch, reduced, 1)[...] *= -1.0
+    return state
+
+
 def _branch_sum(values: np.ndarray, rows: int) -> np.ndarray:
     return values.reshape(-1, rows).sum(axis=0)
 
@@ -97,10 +105,10 @@ def _plan(spec: CircuitSpec, features: np.ndarray, weights: np.ndarray) -> list:
     """Resolve every gate to (kind, axes, angle, parameter factors)."""
     plan = []
     for gate in spec.gates:
-        if gate.kind == "cx":
+        if gate.kind in ("cx", "cz"):
             plan.append(
                 (
-                    "cx",
+                    gate.kind,
                     _axis(spec, gate.control),
                     _axis(spec, gate.target),
                     None,
@@ -134,6 +142,8 @@ def _forward(spec, features, weights):
     for kind, first, second, angle, _ in plan:
         if kind == "cx":
             _apply_cx(state, first, second)
+        elif kind == "cz":
+            _apply_cz(state, first, second)
         elif kind == "ry":
             _apply_ry(state, angle, first)
         else:
@@ -178,25 +188,20 @@ def exact_probabilities(
     return np.clip(np.concatenate(parts), 0.0, 1.0)
 
 
-def _chunk_value_and_gradient(
-    spec, features, labels, sample_weight, weights, objective, epsilon
-):
+def _chunk_gradient(spec, features, weights, dloss_dexpectation):
+    """Adjoint sweep for one chunk, given the loss derivative for its rows."""
     state, plan = _forward(spec, features, weights)
     rows = state.shape[-1]
-    probability = np.clip(
-        (1.0 - _expectation(spec, state)) / 2.0, epsilon, 1.0 - epsilon
-    )
-    loss, dloss_dprobability = objective(probability, labels, sample_weight)
-    dloss_dexpectation = -0.5 * dloss_dprobability
     gradient = np.zeros(spec.n_weights, dtype=float)
 
     adjoint = (
         state.reshape(1 << spec.n_qubits, rows) * _readout_sign(spec)[:, None]
     ).reshape(state.shape)
     for kind, first, second, angle, factors in reversed(plan):
-        if kind == "cx":
-            _apply_cx(state, first, second)
-            _apply_cx(adjoint, first, second)
+        if kind in ("cx", "cz"):
+            apply_entangler = _apply_cx if kind == "cx" else _apply_cz
+            apply_entangler(state, first, second)
+            apply_entangler(adjoint, first, second)
             continue
         if kind == "ry":
             _apply_ry(state, angle, first, inverse=True)
@@ -211,7 +216,7 @@ def _chunk_value_and_gradient(
             gradient[parameter_index] += float(
                 np.sum(weighted if factor is None else weighted * factor)
             )
-    return float(loss), gradient
+    return gradient
 
 
 def value_and_gradient(
@@ -224,7 +229,14 @@ def value_and_gradient(
     epsilon: float = 1e-9,
     chunk_rows: int = CHUNK_ROWS,
 ) -> tuple[float, np.ndarray]:
-    """Objective of the exact readout probability and its adjoint gradient."""
+    """Objective of the exact readout probability and its adjoint gradient.
+
+    The objective is evaluated once over every row rather than per chunk.  Only
+    row-separable losses like cross-entropy may be summed chunk by chunk;
+    ``smooth_auc`` scores pairs and ``smooth_ks`` takes a maximum over the whole
+    sample, and a 64-row chunk can even hold a single class.  Chunking the
+    adjoint sweep stays exact because the gradient is a sum of per-row terms.
+    """
     validate(spec)
     features, parameters = _validate_inputs(spec, x, weights)
     labels = np.asarray(y, dtype=float)
@@ -234,19 +246,21 @@ def value_and_gradient(
     if objective is None:
         objective = lambda p, l, w: balanced_bce(p, l, w, epsilon=epsilon)
 
-    loss = 0.0
+    probability = np.clip(
+        exact_probabilities(spec, features, parameters, chunk_rows=chunk_rows),
+        epsilon,
+        1.0 - epsilon,
+    )
+    loss, dloss_dprobability = objective(probability, labels, sample_weight)
+    dloss_dexpectation = -0.5 * dloss_dprobability
+
     gradient = np.zeros(spec.n_weights, dtype=float)
     for start in range(0, len(features), chunk_rows):
         stop = start + chunk_rows
-        chunk_loss, chunk_gradient = _chunk_value_and_gradient(
+        gradient += _chunk_gradient(
             spec,
             features[start:stop],
-            labels[start:stop],
-            sample_weight[start:stop],
             parameters,
-            objective,
-            epsilon,
+            dloss_dexpectation[start:stop],
         )
-        loss += chunk_loss
-        gradient += chunk_gradient
     return float(loss), gradient

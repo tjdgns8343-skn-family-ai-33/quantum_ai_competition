@@ -48,6 +48,7 @@ from .f1_training import (
 )
 from .compliance import audit_artifact, audit_source
 from .evaluate import evaluate_artifact_on_csv
+from .candidates import CANDIDATES, build_candidate
 from .g1_circuit import G1_DEFAULT_BLOCKS, build_g1_spec
 from .spec_training import SpecTrainConfig, run_spec_cross_validation, run_spec_screen
 from .circuit import FEATURE_LAYOUTS
@@ -542,6 +543,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser_g1.add_argument("--data-dir", default="raw")
         parser_g1.add_argument("--artifacts-dir", default="artifacts")
         parser_g1.add_argument("--blocks", type=int, default=G1_DEFAULT_BLOCKS)
+        parser_g1.add_argument(
+            "--include-x1",
+            action="store_true",
+            help="Give every qubit x1 as well; G1 drops it by default.",
+        )
         parser_g1.add_argument("--seed", type=int, default=2026)
         parser_g1.add_argument("--split-seed", type=int, default=None)
         parser_g1.add_argument("--init-scale", type=float, default=1.0)
@@ -553,7 +559,42 @@ def build_parser() -> argparse.ArgumentParser:
         parser_g1.add_argument("--shots", type=int, default=1024)
         parser_g1.add_argument("--threshold", type=float, default=0.5)
         parser_g1.add_argument("--validation-fraction", type=float, default=0.2)
+        parser_g1.add_argument(
+            "--objective",
+            choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+            default="balanced_bce",
+        )
+        parser_g1.add_argument("--temperature-start", type=float, default=0.30)
+        parser_g1.add_argument("--temperature-stop", type=float, default=0.015)
+        parser_g1.add_argument("--anneal-stages", type=int, default=10)
+        parser_g1.add_argument("--stage-maxiter", type=int, default=40)
         parser_g1.add_argument("--max-rows", type=int, default=None)
+    candidate = sub.add_parser(
+        "cross-validate-candidate",
+        help="Quantum-only OOF for a named candidate architecture",
+    )
+    candidate.add_argument("--candidate", required=True, choices=sorted(CANDIDATES))
+    candidate.add_argument("--data-dir", default="raw")
+    candidate.add_argument("--artifacts-dir", default="artifacts")
+    candidate.add_argument("--seed", type=int, default=2026)
+    candidate.add_argument("--split-seed", type=int, default=2026)
+    candidate.add_argument("--init-scale", type=float, default=1.0)
+    candidate.add_argument("--affine-scale-center", type=float, default=1.0)
+    candidate.add_argument("--affine-scale-jitter", type=float, default=0.5)
+    candidate.add_argument("--maxiter", type=int, default=150)
+    candidate.add_argument("--restarts", type=int, default=1)
+    candidate.add_argument("--folds", type=int, default=5)
+    candidate.add_argument("--shots", type=int, default=1024)
+    candidate.add_argument("--threshold", type=float, default=0.5)
+    candidate.add_argument(
+        "--objective",
+        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+        default="smooth_auc",
+    )
+    candidate.add_argument("--temperature-start", type=float, default=0.30)
+    candidate.add_argument("--temperature-stop", type=float, default=0.015)
+    candidate.add_argument("--anneal-stages", type=int, default=10)
+    candidate.add_argument("--stage-maxiter", type=int, default=30)
     report = sub.add_parser(
         "report-test",
         help="Reporting-only evaluation of an artifact on a labelled CSV",
@@ -737,11 +778,11 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command in ("screen-g1", "cross-validate-g1"):
-        spec = build_g1_spec(args.blocks)
+        spec = build_g1_spec(args.blocks, args.include_x1)
         config = SpecTrainConfig(
             train_csv=Path(args.data_dir) / "public_train.csv",
             artifacts_dir=Path(args.artifacts_dir),
-            label=f"g1b{args.blocks}",
+            label=f"g1b{args.blocks}" + ("x1" if args.include_x1 else ""),
             seed=args.seed,
             split_seed=args.split_seed,
             init_scale=args.init_scale,
@@ -754,9 +795,41 @@ def main(argv: list[str] | None = None) -> None:
             validation_fraction=args.validation_fraction,
             max_rows=args.max_rows,
             decision_threshold=args.threshold,
+            objective=args.objective,
+            temperature_start=args.temperature_start,
+            temperature_stop=args.temperature_stop,
+            anneal_stages=args.anneal_stages,
+            stage_maxiter=args.stage_maxiter,
         )
         runner = run_spec_screen if args.command == "screen-g1" else run_spec_cross_validation
         print(runner(spec, config))
+        return
+    if args.command == "cross-validate-candidate":
+        print(
+            run_spec_cross_validation(
+                build_candidate(args.candidate),
+                SpecTrainConfig(
+                    train_csv=Path(args.data_dir) / "public_train.csv",
+                    artifacts_dir=Path(args.artifacts_dir),
+                    label=args.candidate,
+                    seed=args.seed,
+                    split_seed=args.split_seed,
+                    init_scale=args.init_scale,
+                    affine_scale_center=args.affine_scale_center,
+                    affine_scale_jitter=args.affine_scale_jitter,
+                    maxiter=args.maxiter,
+                    n_restarts=args.restarts,
+                    folds=args.folds,
+                    shots=args.shots,
+                    decision_threshold=args.threshold,
+                    objective=args.objective,
+                    temperature_start=args.temperature_start,
+                    temperature_stop=args.temperature_stop,
+                    anneal_stages=args.anneal_stages,
+                    stage_maxiter=args.stage_maxiter,
+                ),
+            )
+        )
         return
     if args.command == "report-test":
         print(
