@@ -347,3 +347,40 @@ def phase_amplitude_hybrid(n_pairs: int = 2) -> CircuitSpec:
 
 
 CANDIDATES.update({"phmix2": lambda: phase_amplitude_hybrid(2)})
+
+
+# --- Two-qubit family ---------------------------------------------------
+#
+# The tiebreak order is balanced accuracy, then depth, then two-qubit gate
+# count, then submission time.  Depth is checked before gate count, so the
+# target is the same accuracy at depth below C1's 23 -- and C1 also spends 12 CX
+# where the rules only require one.
+#
+# Four qubits made C1 shallow per block but wide: one feature per qubit per
+# block, so covering eight features took four blocks.  Two qubits invert that.
+# Four features per qubit means one full upload of all eight costs depth 4, and
+# a single CX per block is enough to put q1 inside q0's cone.  Alternating RY
+# and RZ along each qubit is what makes the composition genuinely bivariate
+# rather than a ridge function of one linear combination.
+TWO_QUBIT_BLOCK = ((0, 1, 2, 3), (4, 5, 6, 7))
+ONE_CX = (("cx", 1, 0),)
+
+
+def two_qubit(n_blocks: int, *, entangler=ONE_CX) -> CircuitSpec:
+    """Two qubits, four features each per block, one entangler per block."""
+    return build_spec(
+        f"candidate_t2_two_qubit_b{n_blocks}",
+        TWO_QUBIT_BLOCK,
+        n_blocks,
+        entangler=entangler,
+    )
+
+
+CANDIDATES.update(
+    {
+        "t2b2": lambda: two_qubit(2),
+        "t2b3": lambda: two_qubit(3),
+        "t2b4": lambda: two_qubit(4),
+        "t2b6": lambda: two_qubit(6),
+    }
+)
