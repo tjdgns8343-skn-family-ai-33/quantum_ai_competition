@@ -384,3 +384,124 @@ CANDIDATES.update(
         "t2b6": lambda: two_qubit(6),
     }
 )
+
+
+def two_qubit_lean(n_blocks: int, *, mixers: str = "none") -> CircuitSpec:
+    """Two qubits with the separate mixer layers thinned or removed.
+
+    Each data gate is already RY/RZ(theta_scale * x + theta_bias), so its bias is
+    a trainable rotation, and because the features alternate axes along a qubit
+    those biases alternate too.  That overlaps with what a dedicated RZ/RY mixer
+    pair provides, and each mixer layer costs a full unit of depth per block --
+    the second tiebreak criterion.
+    """
+    if mixers not in ("none", "ry"):
+        raise ValueError("mixers must be 'none' or 'ry'")
+    gates: list[Gate] = []
+    cursor = 0
+    for _ in range(n_blocks):
+        for qubit, features in enumerate(TWO_QUBIT_BLOCK):
+            for position, feature in enumerate(features):
+                gates.append(
+                    Gate(
+                        kind=ALTERNATING_AXES[position % 2],
+                        qubit=qubit,
+                        feature=feature,
+                        scale_index=cursor,
+                        bias_index=cursor + 1,
+                    )
+                )
+                cursor += 2
+        if mixers == "ry":
+            for qubit in range(2):
+                gates.append(Gate(kind="ry", qubit=qubit, param_index=cursor))
+                cursor += 1
+        gates.append(Gate(kind="cx", control=1, target=0))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_t2lean_{mixers}_b{n_blocks}",
+        n_qubits=2,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+# Four qubits with two features each: one full upload costs depth 2 instead of
+# the depth 4 two qubits need, at the price of a three-CX tree to reach q0.
+FOUR_WIDE_BLOCK = ((0, 1), (2, 3), (4, 5), (6, 7))
+
+
+def four_qubit_wide(n_blocks: int) -> CircuitSpec:
+    return build_spec(
+        f"candidate_q4wide_b{n_blocks}", FOUR_WIDE_BLOCK, n_blocks, entangler=CX_TREE
+    )
+
+
+CANDIDATES.update(
+    {
+        "t2lean2": lambda: two_qubit_lean(2),
+        "t2lean3": lambda: two_qubit_lean(3),
+        "t2ry2": lambda: two_qubit_lean(2, mixers="ry"),
+        "t2ry3": lambda: two_qubit_lean(3, mixers="ry"),
+        "q4wide2": lambda: four_qubit_wide(2),
+        "q4wide3": lambda: four_qubit_wide(3),
+    }
+)
+
+
+def two_qubit_dense(n_blocks: int, entangle_every: int = 1) -> CircuitSpec:
+    """Two qubits that entangle between encodings instead of after all of them.
+
+    Every architecture here so far encodes all eight features and only then
+    entangles, so each feature is written onto a product state.  Inserting CX
+    between encodings means later features are written onto an already-entangled
+    state, which changes the interaction terms rather than just adding more of
+    them.  ``entangle_every`` counts encoding positions between entanglers, so 1
+    is maximally dense and 4 reproduces the encode-then-entangle layout.
+
+    On two qubits a CX cannot overlap with anything, so density costs depth --
+    the second tiebreak criterion. That is the trade this measures.
+    """
+    if not 1 <= entangle_every <= 4:
+        raise ValueError("entangle_every must be 1..4")
+    gates: list[Gate] = []
+    cursor = 0
+    for _ in range(n_blocks):
+        for position in range(4):
+            for qubit in range(2):
+                gates.append(
+                    Gate(
+                        kind=ALTERNATING_AXES[position % 2],
+                        qubit=qubit,
+                        feature=TWO_QUBIT_BLOCK[qubit][position],
+                        scale_index=cursor,
+                        bias_index=cursor + 1,
+                    )
+                )
+                cursor += 2
+            if (position + 1) % entangle_every == 0:
+                gates.append(Gate(kind="cx", control=1, target=0))
+        for kind in ("rz", "ry"):
+            for qubit in range(2):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_t2dense_e{entangle_every}_b{n_blocks}",
+        n_qubits=2,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+CANDIDATES.update(
+    {
+        "t2d1b2": lambda: two_qubit_dense(2, 1),
+        "t2d2b2": lambda: two_qubit_dense(2, 2),
+        "t2d1b1": lambda: two_qubit_dense(1, 1),
+    }
+)
