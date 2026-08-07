@@ -26,6 +26,7 @@ from .data import load_raw_train
 from .gatespec import CircuitSpec, build_circuit
 from .generic_simulator import exact_probabilities, value_and_gradient
 from .objectives import (
+    fisher_ratio,
     smooth_auc,
     smooth_ks,
     soft_balanced_accuracy,
@@ -174,6 +175,11 @@ def optimize_spec_annealed(
         "soft_balanced_accuracy": lambda t: partial(
             soft_balanced_accuracy, threshold=threshold, temperature=t
         ),
+        # The Fisher ratio has no temperature, so it ignores the schedule and
+        # every stage refines the same objective.  The recorded curve then reads
+        # as convergence rather than annealing, and the stage that scores best
+        # out-of-fold is where further refinement starts to overfit.
+        "fisher_ratio": lambda _t: fisher_ratio,
     }
     if surrogate not in builders:
         raise ValueError(f"Unknown surrogate: {surrogate!r}")

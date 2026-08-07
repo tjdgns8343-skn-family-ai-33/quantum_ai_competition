@@ -22,6 +22,15 @@ OBJECTIVE_SENTENCES = {
         "a smooth surrogate of balanced accuracy, sigmoid((p - threshold) / T), "
         "lowering T so the objective approaches the scored metric."
     ),
+    "fisher_ratio": (
+        "Training first minimized the class-balanced binary cross-entropy of that "
+        "measured probability against the raw public_train.csv label, then maximized "
+        "the Fisher discriminant ratio of the same measured probability, "
+        "(mean_pos - mean_neg)^2 / (var_pos + var_neg), where both means and both "
+        "variances are taken over the raw public_train.csv labels. The ratio has no "
+        "temperature and no threshold inside it. Both stages read nothing but the "
+        "circuit's measured probability and the raw training label."
+    ),
     "smooth_ks": (
         "Training first minimized the class-balanced binary cross-entropy of that "
         "measured probability against the raw public_train.csv label, then annealed "

@@ -568,6 +568,37 @@ CANDIDATES.update(
 )
 
 
+def c1_feature_ablated_many(drop: tuple[int, ...]) -> CircuitSpec:
+    """C1 with several features' data gates replaced by plain rotations."""
+    gates: list[Gate] = []
+    cursor = 0
+    for block_features in C1_BLOCKS:
+        for qubit, features in enumerate(block_features):
+            for feature in features:
+                if feature in drop:
+                    gates.append(Gate(kind="ry", qubit=qubit, param_index=cursor))
+                    cursor += 1
+                else:
+                    gates.append(
+                        Gate(kind="ry", qubit=qubit, feature=feature,
+                             scale_index=cursor, bias_index=cursor + 1)
+                    )
+                    cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(4):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        for entangling_kind, control, target in C1_FUNNEL:
+            gates.append(Gate(kind=entangling_kind, control=control, target=target))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    tag = "".join(f"x{i + 1}" for i in sorted(drop))
+    return CircuitSpec(
+        name=f"candidate_c1_ablate_{tag}", n_qubits=4, n_weights=cursor,
+        readout_qubit=READOUT_QUBIT, gates=tuple(gates),
+    )
+
+
 def c1_feature_ablated(drop: int) -> CircuitSpec:
     """C1 with one feature's data gates replaced by plain trainable rotations.
 
@@ -607,3 +638,173 @@ def c1_feature_ablated(drop: int) -> CircuitSpec:
 
 
 CANDIDATES.update({f"abl_x{i+1}": (lambda i=i: c1_feature_ablated(i)) for i in range(8)})
+
+
+# One representative per redundant group.  x3 is the second harmonic of x2 and
+# x6-x8 track x5, so dropping them leaves x1, x2, x4, x5 -- the columns the
+# label-free structure says carry independent information.
+SURVIVORS = (0, 1, 3, 4)  # x1, x2, x4, x5
+
+
+def survivors_per_qubit(n_blocks: int, *, order=(1, 4, 0, 3)) -> CircuitSpec:
+    """One surviving feature per qubit, so no qubit sits idle.
+
+    Ablating x3, x6, x7 and x8 out of C1 in place leaves q2 encoding nothing at
+    all -- both of its columns are gone -- and q1 and q3 encoding one feature
+    each against q0's two.  Eight of C1's sixteen data gates become plain
+    rotations.  Reassigning one survivor to each qubit spends every data gate.
+
+    The default order puts x2 on the readout qubit.  In C1 the readout carried
+    x1, which is constant at -0.353 for 87% of rows, so q0's own rotation was
+    nearly data-independent and everything had to arrive through the funnel.
+    Removing a column costs the fit 0.0167 for x2 and 0.0148 for x5 against
+    0.0053 for x1, so the readout now holds the strongest column.
+    """
+    return build_spec(
+        f"candidate_k1_survivors_b{n_blocks}",
+        tuple((feature,) for feature in order),
+        n_blocks,
+        entangler=C1_FUNNEL,
+    )
+
+
+def survivors_two_qubit(n_blocks: int) -> CircuitSpec:
+    """The same four columns folded onto two qubits, for the tiebreak.
+
+    Ranking is balanced accuracy, then depth, then two-qubit gate count, so a
+    circuit that matches on accuracy with fewer entanglers wins.  Each qubit
+    takes two columns on alternating axes; consecutive same-axis rotations would
+    compose into RY(w_a*x_a + w_b*x_b), one angle carrying two features.
+    """
+    return build_spec(
+        f"candidate_k2_survivors_2q_b{n_blocks}",
+        ((1, 0), (4, 3)),  # q0: x2 then x1;  q1: x5 then x4
+        n_blocks,
+        entangler=(("cx", 1, 0),),
+    )
+
+
+CANDIDATES.update(
+    {f"k4b{b}": (lambda b=b: survivors_per_qubit(b)) for b in (2, 3, 4)}
+)
+# Control for the readout placement claim: C1's own column order, x1 on q0.
+CANDIDATES.update(
+    {f"k4o{b}": (lambda b=b: survivors_per_qubit(b, order=SURVIVORS)) for b in (2, 4)}
+)
+CANDIDATES.update(
+    {f"k2b{b}": (lambda b=b: survivors_two_qubit(b)) for b in (3, 4, 5)}
+)
+# x3 and x8 each improve the fit when removed, so try them together and with
+# the next weakest columns. Selection uses the circuit's own training loss, the
+# same quantum-only basis as the beam search in the compliance report.
+CANDIDATES.update({
+    "abl_38":   lambda: c1_feature_ablated_many((2, 7)),
+    "abl_386":  lambda: c1_feature_ablated_many((2, 7, 5)),
+    "abl_3867": lambda: c1_feature_ablated_many((2, 7, 5, 6)),
+    "abl_38_1": lambda: c1_feature_ablated_many((2, 7, 0)),
+})
+
+
+def two_qubit_vote(n_blocks: int) -> CircuitSpec:
+    """Aggregate with a controlled rotation instead of a bare CX.
+
+    Every circuit here moves information to the readout with CX, which maps
+    |a,b> to |a, b xor a>: the readout accumulates parity. Parity is the worst
+    aggregator for classification, flipping on any single input. A controlled
+    rotation instead adds a contribution to the readout's angle, so the measured
+    probability becomes a monotone function of a weighted sum -- the additive
+    structure behind logistic regression, boosting and ensembles.
+
+    CRY(theta) = RY(theta/2) CX RY(-theta/2) CX, all permitted gates, and the
+    two RY angles are trainable parameters rather than data, so the
+    single-feature angle rule is not involved.
+    """
+    gates: list[Gate] = []
+    cursor = 0
+    for _ in range(n_blocks):
+        for qubit, features in enumerate(TWO_QUBIT_BLOCK):
+            for position, feature in enumerate(features):
+                gates.append(
+                    Gate(kind=ALTERNATING_AXES[position % 2], qubit=qubit,
+                         feature=feature, scale_index=cursor, bias_index=cursor + 1)
+                )
+                cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(2):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        # Controlled RY from q1 into the readout, decomposed into allowed gates.
+        half_a, half_b = cursor, cursor + 1
+        cursor += 2
+        gates.append(Gate(kind="ry", qubit=0, param_index=half_a))
+        gates.append(Gate(kind="cx", control=1, target=0))
+        gates.append(Gate(kind="ry", qubit=0, param_index=half_b))
+        gates.append(Gate(kind="cx", control=1, target=0))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_t2vote_b{n_blocks}", n_qubits=2, n_weights=cursor,
+        readout_qubit=READOUT_QUBIT, gates=tuple(gates),
+    )
+
+
+CANDIDATES.update({"t2v2": lambda: two_qubit_vote(2), "t2v3": lambda: two_qubit_vote(3)})
+
+
+def two_qubit_flex(
+    n_blocks: int, drop: tuple[int, ...] = (), vote: bool = False
+) -> CircuitSpec:
+    """Two-qubit base with the two independent levers this search turned up.
+
+    ``drop`` replaces a column's data gates with plain trainable rotations,
+    which removes the feature while keeping the rotation, so a column that is
+    noise stops costing capacity. ``vote`` replaces the bare CX with a
+    controlled RY, so the readout accumulates a weighted sum instead of parity.
+
+    The two act on different parts of the circuit -- what enters the angles
+    versus how information reaches the readout -- so they compose.
+    """
+    gates: list[Gate] = []
+    cursor = 0
+    for _ in range(n_blocks):
+        for position in range(4):
+            for qubit in range(2):
+                feature = TWO_QUBIT_BLOCK[qubit][position]
+                axis = ALTERNATING_AXES[position % 2]
+                if feature in drop:
+                    gates.append(Gate(kind=axis, qubit=qubit, param_index=cursor))
+                    cursor += 1
+                else:
+                    gates.append(
+                        Gate(kind=axis, qubit=qubit, feature=feature,
+                             scale_index=cursor, bias_index=cursor + 1)
+                    )
+                    cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(2):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        if vote:
+            gates.append(Gate(kind="ry", qubit=0, param_index=cursor))
+            gates.append(Gate(kind="cx", control=1, target=0))
+            gates.append(Gate(kind="ry", qubit=0, param_index=cursor + 1))
+            gates.append(Gate(kind="cx", control=1, target=0))
+            cursor += 2
+        else:
+            gates.append(Gate(kind="cx", control=1, target=0))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    tag = ("d" + "".join(str(i + 1) for i in sorted(drop)) if drop else "") + ("v" if vote else "")
+    return CircuitSpec(
+        name=f"candidate_f2b{n_blocks}{tag}", n_qubits=2, n_weights=cursor,
+        readout_qubit=READOUT_QUBIT, gates=tuple(gates),
+    )
+
+
+DROP38 = (2, 7)  # x3 and x8: each improved the fit when removed
+CANDIDATES.update({
+    f"f2b{b}{t}": (lambda b=b, d=d, v=v: two_qubit_flex(b, d, v))
+    for b in (2, 3)
+    for t, d, v in (("", (), False), ("d", DROP38, False),
+                    ("v", (), True), ("dv", DROP38, True))
+})

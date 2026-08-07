@@ -51,6 +51,53 @@ def balanced_bce(
     return float(loss), derivative
 
 
+def fisher_ratio(
+    probability: np.ndarray,
+    labels: np.ndarray,
+    sample_weight: np.ndarray,
+    *,
+    epsilon: float = 1e-9,
+) -> ObjectiveResult:
+    """Negative Fisher discriminant ratio of the readout probability.
+
+    ``J = (mu_pos - mu_neg)**2 / (var_pos + var_neg)``, maximised.
+
+    Every other objective here either ranks rows or scores them one at a time,
+    so none of them says anything about how tightly each class clusters.  AUC in
+    particular is invariant to any monotone rescaling of the probabilities: it
+    cannot tell a well-separated pair of clusters from two long overlapping
+    tails with the same ordering.  Dividing by the within-class variance
+    penalises the spread directly, which is regularisation expressed in the
+    objective rather than in the iteration cap.
+
+    There is no temperature and no threshold.  Both submissions that lost today
+    were beaten by their own annealing-stage choice, and a schedule-free
+    objective removes that decision entirely.  ``sample_weight`` is unused: the
+    two class means and variances are each already normalised by their own
+    count, so the ratio is class-balanced by construction.
+    """
+    values = np.asarray(probability, dtype=float)
+    mask = np.asarray(labels, dtype=int) == 1
+    positive, negative = values[mask], values[~mask]
+    if len(positive) == 0 or len(negative) == 0:
+        raise ValueError("Both classes must be present for the Fisher ratio.")
+
+    mean_gap = float(positive.mean() - negative.mean())
+    scatter = float(positive.var() + negative.var()) + epsilon
+    ratio = mean_gap * mean_gap / scatter
+
+    # d(-J)/dp, from d(gap)/dp = +/-1/n and d(var)/dp = 2(p - mean)/n.
+    derivative = np.empty_like(values)
+    common = 2.0 * mean_gap / scatter
+    derivative[mask] = -(
+        common * (1.0 - mean_gap * (positive - positive.mean()) / scatter)
+    ) / len(positive)
+    derivative[~mask] = (
+        common * (1.0 + mean_gap * (negative - negative.mean()) / scatter)
+    ) / len(negative)
+    return float(-ratio), derivative
+
+
 def soft_balanced_accuracy(
     probability: np.ndarray,
     labels: np.ndarray,

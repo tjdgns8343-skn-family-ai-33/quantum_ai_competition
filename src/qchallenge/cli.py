@@ -50,7 +50,12 @@ from .compliance import audit_artifact, audit_source
 from .evaluate import evaluate_artifact_on_csv
 from .candidates import CANDIDATES, build_candidate
 from .g1_circuit import G1_DEFAULT_BLOCKS, build_g1_spec
-from .spec_training import SpecTrainConfig, run_spec_cross_validation, run_spec_screen
+from .spec_training import (
+    SpecTrainConfig,
+    run_spec_cross_validation,
+    run_spec_final,
+    run_spec_screen,
+)
 from .circuit import FEATURE_LAYOUTS
 from .feature_search import FeatureSearchConfig, run_feature_search
 from .training import TrainConfig, run_final, run_screen
@@ -333,7 +338,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_c1_training_args(c1_final, validation=False)
     c1_final.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+        choices=(
+            "balanced_bce",
+            "soft_balanced_accuracy",
+            "smooth_auc",
+            "smooth_ks",
+            "fisher_ratio",
+        ),
         default="balanced_bce",
     )
     c1_final.add_argument("--temperature-start", type=float, default=0.30)
@@ -361,7 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
     c1_cv.add_argument("--restarts", type=int, default=1)
     c1_cv.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+        choices=(
+            "balanced_bce",
+            "soft_balanced_accuracy",
+            "smooth_auc",
+            "smooth_ks",
+            "fisher_ratio",
+        ),
         default="balanced_bce",
         help="Annealed surrogates warm up on BCE; smooth_auc scores all pairs instead of the threshold band.",
     )
@@ -561,7 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
         parser_g1.add_argument("--validation-fraction", type=float, default=0.2)
         parser_g1.add_argument(
             "--objective",
-            choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+            choices=(
+            "balanced_bce",
+            "soft_balanced_accuracy",
+            "smooth_auc",
+            "smooth_ks",
+            "fisher_ratio",
+        ),
             default="balanced_bce",
         )
         parser_g1.add_argument("--temperature-start", type=float, default=0.30)
@@ -594,13 +617,55 @@ def build_parser() -> argparse.ArgumentParser:
     candidate.add_argument("--threshold", type=float, default=0.5)
     candidate.add_argument(
         "--objective",
-        choices=("balanced_bce", "soft_balanced_accuracy", "smooth_auc", "smooth_ks"),
+        choices=(
+            "balanced_bce",
+            "soft_balanced_accuracy",
+            "smooth_auc",
+            "smooth_ks",
+            "fisher_ratio",
+        ),
         default="smooth_auc",
     )
     candidate.add_argument("--temperature-start", type=float, default=0.30)
     candidate.add_argument("--temperature-stop", type=float, default=0.015)
     candidate.add_argument("--anneal-stages", type=int, default=10)
     candidate.add_argument("--stage-maxiter", type=int, default=30)
+    candidate_final = sub.add_parser(
+        "train-final-candidate",
+        help="Train a named candidate on the full train set and emit a submission",
+    )
+    candidate_final.add_argument("--candidate", required=True, choices=sorted(CANDIDATES))
+    candidate_final.add_argument("--data-dir", default="raw")
+    candidate_final.add_argument("--artifacts-dir", default="artifacts")
+    candidate_final.add_argument("--seed", type=int, default=2026)
+    candidate_final.add_argument("--init-scale", type=float, default=1.0)
+    candidate_final.add_argument("--affine-scale-center", type=float, default=1.0)
+    candidate_final.add_argument("--affine-scale-jitter", type=float, default=0.5)
+    candidate_final.add_argument("--maxiter", type=int, default=150)
+    candidate_final.add_argument("--restarts", type=int, default=2)
+    candidate_final.add_argument("--shots", type=int, default=1024)
+    candidate_final.add_argument("--threshold", type=float, default=0.5)
+    candidate_final.add_argument(
+        "--objective",
+        choices=(
+            "balanced_bce",
+            "soft_balanced_accuracy",
+            "smooth_auc",
+            "smooth_ks",
+            "fisher_ratio",
+        ),
+        default="smooth_auc",
+    )
+    candidate_final.add_argument("--temperature-start", type=float, default=0.30)
+    candidate_final.add_argument("--temperature-stop", type=float, default=0.015)
+    candidate_final.add_argument("--anneal-stages", type=int, default=10)
+    candidate_final.add_argument("--stage-maxiter", type=int, default=40)
+    candidate_final.add_argument(
+        "--select-stage",
+        type=int,
+        required=True,
+        help="Annealing stage to submit, chosen on train-only cross-validation.",
+    )
     report = sub.add_parser(
         "report-test",
         help="Reporting-only evaluation of an artifact on a labelled CSV",
@@ -836,6 +901,33 @@ def main(argv: list[str] | None = None) -> None:
                     stage_maxiter=args.stage_maxiter,
                     validation_fraction=args.validation_fraction,
                 ),
+            )
+        )
+        return
+    if args.command == "train-final-candidate":
+        print(
+            run_spec_final(
+                build_candidate(args.candidate),
+                SpecTrainConfig(
+                    train_csv=Path(args.data_dir) / "public_train.csv",
+                    artifacts_dir=Path(args.artifacts_dir),
+                    label=args.candidate,
+                    seed=args.seed,
+                    split_seed=args.seed,
+                    init_scale=args.init_scale,
+                    affine_scale_center=args.affine_scale_center,
+                    affine_scale_jitter=args.affine_scale_jitter,
+                    maxiter=args.maxiter,
+                    n_restarts=args.restarts,
+                    shots=args.shots,
+                    decision_threshold=args.threshold,
+                    objective=args.objective,
+                    temperature_start=args.temperature_start,
+                    temperature_stop=args.temperature_stop,
+                    anneal_stages=args.anneal_stages,
+                    stage_maxiter=args.stage_maxiter,
+                ),
+                args.select_stage,
             )
         )
         return
