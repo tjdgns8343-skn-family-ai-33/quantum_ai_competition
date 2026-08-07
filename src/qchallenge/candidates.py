@@ -566,3 +566,44 @@ CANDIDATES.update(
         "t2p4b3": lambda: two_qubit_projection(3, 4),
     }
 )
+
+
+def c1_feature_ablated(drop: int) -> CircuitSpec:
+    """C1 with one feature's data gates replaced by plain trainable rotations.
+
+    x1 is constant at -0.353 for 5,201 of 6,000 rows, so for 87% of the data its
+    gates act as a fixed learned rotation rather than an encoding. Simply
+    removing them would confound two things: losing whatever the remaining 13%
+    carries, and losing the rotation itself. Keeping the gate but dropping its
+    dependence on the feature isolates the first.
+    """
+    gates: list[Gate] = []
+    cursor = 0
+    for block_features in C1_BLOCKS:
+        for qubit, features in enumerate(block_features):
+            for feature in features:
+                if feature == drop:
+                    gates.append(Gate(kind="ry", qubit=qubit, param_index=cursor))
+                    cursor += 1
+                else:
+                    gates.append(
+                        Gate(kind="ry", qubit=qubit, feature=feature,
+                             scale_index=cursor, bias_index=cursor + 1)
+                    )
+                    cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(4):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        for entangling_kind, control, target in C1_FUNNEL:
+            gates.append(Gate(kind=entangling_kind, control=control, target=target))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_c1_ablate_x{drop + 1}",
+        n_qubits=4, n_weights=cursor, readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+CANDIDATES.update({f"abl_x{i+1}": (lambda i=i: c1_feature_ablated(i)) for i in range(8)})
