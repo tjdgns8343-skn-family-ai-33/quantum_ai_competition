@@ -505,3 +505,64 @@ CANDIDATES.update(
         "t2d1b1": lambda: two_qubit_dense(1, 1),
     }
 )
+
+
+def two_qubit_projection(n_blocks: int, group: int = 4) -> CircuitSpec:
+    """Same-axis data gates, so each qubit receives a learned linear projection.
+
+    Rotations about one axis compose additively, so RY(w1*x1)...RY(w4*x4) acts as
+    RY(sum wi*xi + sum bi): the qubit is driven by one learned linear combination
+    of its features, which is the inductive bias a logistic regression encodes
+    and the only structural idea this repository has never allowed. Every other
+    circuit here alternates RY/RZ specifically to prevent that composition.
+
+    ``group`` sets how many consecutive gates share an axis, so 4 puts all of a
+    qubit's features into one effective angle and 2 puts two.
+
+    Compliance is a judgement call and this is built for measurement, not for
+    submission. Each gate in the QASM carries a single raw feature in the
+    permitted affine form and nothing is precomputed outside the circuit, but a
+    reviewer computing the effective angle sees several features in it. Decide
+    that question only if the numbers justify raising it.
+    """
+    if group not in (2, 4):
+        raise ValueError("group must be 2 or 4")
+    gates: list[Gate] = []
+    cursor = 0
+    for _ in range(n_blocks):
+        for position in range(4):
+            axis = ALTERNATING_AXES[(position // group) % 2]
+            for qubit in range(2):
+                gates.append(
+                    Gate(
+                        kind=axis,
+                        qubit=qubit,
+                        feature=TWO_QUBIT_BLOCK[qubit][position],
+                        scale_index=cursor,
+                        bias_index=cursor + 1,
+                    )
+                )
+                cursor += 2
+        for kind in ("rz", "ry"):
+            for qubit in range(2):
+                gates.append(Gate(kind=kind, qubit=qubit, param_index=cursor))
+                cursor += 1
+        gates.append(Gate(kind="cx", control=1, target=0))
+    gates.append(Gate(kind="ry", qubit=READOUT_QUBIT, param_index=cursor))
+    cursor += 1
+    return CircuitSpec(
+        name=f"candidate_t2proj_g{group}_b{n_blocks}",
+        n_qubits=2,
+        n_weights=cursor,
+        readout_qubit=READOUT_QUBIT,
+        gates=tuple(gates),
+    )
+
+
+CANDIDATES.update(
+    {
+        "t2p4b2": lambda: two_qubit_projection(2, 4),   # all four features in one angle
+        "t2p2b2": lambda: two_qubit_projection(2, 2),   # two features per angle
+        "t2p4b3": lambda: two_qubit_projection(3, 4),
+    }
+)
